@@ -165,7 +165,11 @@ class TestAuth(unittest.TestCase):
                 import gsc_server as mod
 
             with patch.object(mod, "TOKEN_FILE", os.path.join(tmpdir, "nonexistent_token.json")), \
-                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "nonexistent_secrets.json")):
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "nonexistent_secrets.json")), \
+                 patch("sys.stdin.isatty", return_value=True):
+                # This asserts the interactive path (a human can run the OAuth flow), so
+                # isatty is forced True regardless of the runner's actual stdin — the
+                # non-interactive MCP path is TestAuth.test_expired_token_no_refresh_raises_runtime_error.
                 with self.assertRaises(FileNotFoundError):
                     mod.get_gsc_service_oauth()
 
@@ -671,7 +675,10 @@ class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(mod, "TOKEN_FILE", token_path), \
                  patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
-                 patch("gsc_server.InstalledAppFlow") as mock_flow_cls:
+                 patch("gsc_server.InstalledAppFlow") as mock_flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True):
+                # Asserts the interactive re-auth path (a human runs this from a real
+                # terminal); isatty forced True regardless of the runner's actual stdin.
                 mock_flow = MagicMock()
                 mock_flow.run_local_server.return_value = mock_creds
                 mock_flow_cls.from_client_secrets_file.return_value = mock_flow
@@ -716,6 +723,174 @@ class TestStdoutClean(unittest.TestCase):
 
         stdout_output = captured.getvalue()
         self.assertEqual(stdout_output, "", f"Unexpected stdout: {stdout_output!r}")
+
+
+# ---------------------------------------------------------------------------
+# TestSiteVerification
+#
+# Covers what the siteverification scope bump added in 0.3.1:
+# - a token saved under the old, narrower scope must not be reused silently
+#   (it is not expired, so without an explicit scope check it would be)
+# - the two id forms Search Console uses (sc-domain:/URL) map onto the two
+#   the Site Verification API accepts (INET_DOMAIN/SITE)
+# - get_verification_token is read-only, verify_site is gated behind
+#   GSC_ALLOW_DESTRUCTIVE like the other ownership-changing tools
+# - a 400 means different things depending on which call produced it
+# ---------------------------------------------------------------------------
+
+class TestSiteVerificationScope(unittest.TestCase):
+
+    def test_scopes_include_siteverification(self):
+        mod = _load_module()
+        self.assertIn("https://www.googleapis.com/auth/siteverification", mod.SCOPES)
+        self.assertIn("https://www.googleapis.com/auth/webmasters", mod.SCOPES)
+
+    def test_stored_token_missing_new_scope_triggers_reconsent(self):
+        """A token from before the scope bump must not be reused as-is."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"GSC_SKIP_OAUTH": "false", "GSC_DATA_STATE": "all",
+                   "GSC_ALLOW_DESTRUCTIVE": "false", "GSC_CONFIG_DIR": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                if "gsc_server" in sys.modules:
+                    del sys.modules["gsc_server"]
+                import gsc_server as mod
+
+            old_scope_creds = MagicMock()
+            old_scope_creds.valid = True
+            old_scope_creds.has_scopes.return_value = False
+
+            open(os.path.join(tmpdir, "token.json"), "w").write("{}")
+
+            with patch("gsc_server.Credentials.from_authorized_user_file", return_value=old_scope_creds), \
+                 patch.object(mod, "TOKEN_FILE", os.path.join(tmpdir, "token.json")), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+                # Not a TTY here, so the code takes the same "cannot refresh"
+                # path a headless MCP server would — proof the under-scoped
+                # token was discarded rather than handed to build().
+                with self.assertRaises(RuntimeError):
+                    mod.get_oauth_credentials()
+
+    def test_stored_token_with_all_scopes_is_reused(self):
+        mod = _load_module({"GSC_SKIP_OAUTH": "false"})
+        good_creds = MagicMock()
+        good_creds.valid = True
+        good_creds.has_scopes.return_value = True
+
+        with patch("gsc_server.Credentials.from_authorized_user_file", return_value=good_creds), \
+             patch.object(mod, "TOKEN_FILE", "/dev/null"), \
+             patch("gsc_server.os.path.exists", return_value=True):
+            creds = mod.get_oauth_credentials()
+
+        self.assertIs(creds, good_creds)
+
+
+class TestSiteVerificationTarget(unittest.TestCase):
+
+    def test_domain_property_becomes_inet_domain(self):
+        mod = _load_module()
+        self.assertEqual(
+            mod._verification_target("sc-domain:puur-skincare.nl"),
+            {"type": "INET_DOMAIN", "identifier": "puur-skincare.nl"},
+        )
+
+    def test_prefix_property_becomes_site(self):
+        mod = _load_module()
+        self.assertEqual(
+            mod._verification_target("https://www.puur-skincare.nl/"),
+            {"type": "SITE", "identifier": "https://www.puur-skincare.nl/"},
+        )
+
+
+class TestGetVerificationToken(unittest.IsolatedAsyncioTestCase):
+
+    async def test_sends_domain_target_and_returns_token(self):
+        mod = _load_module()
+        service = _make_service()
+        service.webResource().getToken().execute.return_value = {
+            "token": "google-site-verification=abc123"
+        }
+
+        with patch("gsc_server.get_site_verification_service", return_value=service):
+            result = await mod.get_verification_token("sc-domain:example.com")
+
+        body = service.webResource().getToken.call_args.kwargs["body"]
+        self.assertEqual(body["site"]["type"], "INET_DOMAIN")
+        self.assertEqual(body["site"]["identifier"], "example.com")
+        self.assertEqual(body["verificationMethod"], "DNS_TXT")
+        self.assertIn("google-site-verification=abc123", result)
+
+    async def test_not_gated_by_allow_destructive(self):
+        """Read-only: must work even with GSC_ALLOW_DESTRUCTIVE unset."""
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
+        service = _make_service()
+        service.webResource().getToken().execute.return_value = {"token": "t"}
+
+        with patch("gsc_server.get_site_verification_service", return_value=service):
+            result = await mod.get_verification_token("sc-domain:example.com")
+
+        self.assertNotIn("Safety", result)
+
+
+class TestVerifySite(unittest.IsolatedAsyncioTestCase):
+
+    async def test_blocked_by_default(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
+        result = await mod.verify_site("sc-domain:example.com")
+        self.assertIn("Safety", result)
+
+    async def test_allowed_when_flag_set_reports_owners(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        service = _make_service()
+        service.webResource().insert().execute.return_value = {"owners": ["mail@katama.nl"]}
+
+        with patch("gsc_server.get_site_verification_service", return_value=service):
+            result = await mod.verify_site("sc-domain:example.com")
+
+        kwargs = service.webResource().insert.call_args.kwargs
+        self.assertEqual(kwargs["verificationMethod"], "DNS_TXT")
+        self.assertEqual(kwargs["body"]["site"]["identifier"], "example.com")
+        self.assertIn("verified", result)
+        self.assertIn("mail@katama.nl", result)
+
+
+class TestVerificationErrorHandling(unittest.IsolatedAsyncioTestCase):
+    """A 400 means something different depending on which call produced it."""
+
+    @staticmethod
+    def _http_error(status, message):
+        resp = MagicMock()
+        resp.status = status
+        content = json.dumps({"error": {"message": message}}).encode("utf-8")
+        from googleapiclient.errors import HttpError
+        return HttpError(resp, content)
+
+    async def test_token_request_400_reports_validation_error_not_propagation(self):
+        """Nothing is published yet when fetching a token, so propagation advice
+        would send the user chasing a DNS record that does not exist."""
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        service = _make_service()
+        service.webResource().getToken().execute.side_effect = self._http_error(
+            400, "Invalid verification method for this site type."
+        )
+
+        with patch("gsc_server.get_site_verification_service", return_value=service):
+            result = await mod.get_verification_token("sc-domain:example.com", method="FILE")
+
+        self.assertIn("Invalid verification method", result)
+        self.assertNotIn("resolve", result)
+
+    async def test_verify_400_keeps_propagation_advice(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        service = _make_service()
+        service.webResource().insert().execute.side_effect = self._http_error(
+            400, "Token not found."
+        )
+
+        with patch("gsc_server.get_site_verification_service", return_value=service):
+            result = await mod.verify_site("sc-domain:example.com")
+
+        self.assertIn("Token not found", result)
+        self.assertIn("resolve", result)
 
 
 if __name__ == "__main__":

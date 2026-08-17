@@ -73,7 +73,13 @@ if _raw_data_state not in ("all", "final"):
     )
 DATA_STATE = _raw_data_state
 
-SCOPES = ["https://www.googleapis.com/auth/webmasters"]
+SCOPES = [
+    "https://www.googleapis.com/auth/webmasters",
+    # Needed for get_verification_token/verify_site: confirming ownership of a
+    # property added with add_site runs through the Site Verification API,
+    # which the webmasters scope does not cover.
+    "https://www.googleapis.com/auth/siteverification",
+]
 
 def get_gsc_service():
     """
@@ -108,12 +114,18 @@ def get_gsc_service():
         f"{', '.join([p for p in POSSIBLE_CREDENTIAL_PATHS[1:] if p])}"
     )
 
-def get_gsc_service_oauth():
+def get_oauth_credentials():
     """
-    Returns an authorized Search Console service object using OAuth.
+    Returns authorized OAuth credentials covering every scope in SCOPES.
+
+    A token saved before a scope was added stays valid (it is not expired), so
+    reusing it blindly means the first call to the newly scoped API fails with
+    an opaque 403. Credentials that miss any required scope are therefore
+    treated as unusable, which routes them through the same re-consent path
+    below as a missing or expired token.
     """
     creds = None
-    
+
     # Check if token file exists
     if os.path.exists(TOKEN_FILE):
         try:
@@ -123,7 +135,11 @@ def get_gsc_service_oauth():
             if os.path.exists(TOKEN_FILE):
                 os.remove(TOKEN_FILE)
             creds = None
-    
+
+    # A token granted under a narrower scope set cannot serve the new APIs.
+    if creds is not None and not creds.has_scopes(SCOPES):
+        creds = None
+
     # If credentials don't exist or are invalid, get new ones
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -167,9 +183,28 @@ def get_gsc_service_oauth():
             # Save the credentials for future use
             with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
-    
-    # Build and return the service
+
+    return creds
+
+
+def get_gsc_service_oauth():
+    """
+    Returns an authorized Search Console service object using OAuth.
+    """
+    creds = get_oauth_credentials()
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+
+
+def get_site_verification_service():
+    """
+    Returns an authorized Site Verification service object.
+
+    Ownership of a property is confirmed through this API, not through the
+    Search Console API, which is why SCOPES carries the siteverification scope.
+    OAuth only: service accounts cannot own a verification token.
+    """
+    creds = get_oauth_credentials()
+    return build("siteVerification", "v1", credentials=creds, cache_discovery=False)
 
 
 def _site_not_found_error(site_url: str) -> str:
@@ -353,6 +388,144 @@ async def delete_site(site_url: str) -> str:
             return f"Error removing site (HTTP {error_code}): {error_message}"
     except Exception as e:
         return f"Error removing site: {str(e)}"
+
+
+def _verification_target(site_url: str):
+    """
+    Translates a Search Console property id into a Site Verification target.
+
+    Search Console identifies a domain property as "sc-domain:example.com" and
+    a prefix property as a URL. The Site Verification API knows neither form:
+    it wants a type of INET_DOMAIN or SITE plus a bare identifier.
+    """
+    if site_url.startswith("sc-domain:"):
+        return {"type": "INET_DOMAIN", "identifier": site_url[len("sc-domain:"):]}
+    return {"type": "SITE", "identifier": site_url}
+
+
+@mcp.tool()
+async def get_verification_token(site_url: str, method: str = "DNS_TXT") -> str:
+    """
+    Get the token needed to prove ownership of a property.
+
+    Read-only: this only requests a token to publish, it does not claim
+    anything. verify_site is what actually claims ownership once the token is
+    visible to Google.
+
+    Args:
+        site_url: Property to verify, in Search Console form (e.g. "sc-domain:example.com"
+                  or "https://example.com/").
+        method: Verification method. "DNS_TXT" (default) or "DNS_CNAME" for domain
+                properties; "FILE" or "META" for prefix properties.
+    """
+    try:
+        service = get_site_verification_service()
+        target = _verification_target(site_url)
+
+        response = service.webResource().getToken(
+            body={
+                "site": {"type": target["type"], "identifier": target["identifier"]},
+                "verificationMethod": method,
+            }
+        ).execute()
+
+        token = response.get("token", "")
+        lines = [
+            f"Verification token for {site_url} (method {method}):",
+            token,
+        ]
+        if method == "DNS_TXT":
+            lines.append("")
+            lines.append(
+                f"Publish this as a TXT record on {target['identifier']}, wait for it to "
+                f"resolve, then call verify_site with the same method."
+            )
+        return "\n".join(lines)
+    except HttpError as e:
+        return _verification_http_error(e, site_url, "getting verification token")
+    except Exception as e:
+        return f"Error getting verification token: {str(e)}"
+
+
+@mcp.tool()
+async def verify_site(site_url: str, method: str = "DNS_TXT") -> str:
+    """
+    Claim ownership of a property after its verification token is published.
+
+    Fails while the token is not yet visible to Google, which for a DNS record
+    means the change still has to propagate. That failure is not permanent:
+    retry once the record resolves.
+
+    Args:
+        site_url: Property to verify, in Search Console form (e.g. "sc-domain:example.com").
+        method: The same method used for get_verification_token.
+    """
+    if not ALLOW_DESTRUCTIVE:
+        return (
+            "Safety: verify_site claims ownership of a property in your Google account. "
+            "Set GSC_ALLOW_DESTRUCTIVE=true in your environment to enable add/delete/verify tools."
+        )
+    try:
+        service = get_site_verification_service()
+        target = _verification_target(site_url)
+
+        response = service.webResource().insert(
+            verificationMethod=method,
+            body={"site": {"type": target["type"], "identifier": target["identifier"]}},
+        ).execute()
+
+        owners = response.get("owners", [])
+        lines = [f"Ownership of {site_url} verified."]
+        if owners:
+            lines.append(f"Owners: {', '.join(owners)}")
+        return "\n".join(lines)
+    except HttpError as e:
+        return _verification_http_error(e, site_url, "verifying site", token_may_be_missing=True)
+    except Exception as e:
+        return f"Error verifying site: {str(e)}"
+
+
+def _verification_http_error(
+    e: HttpError, site_url: str, action: str, token_may_be_missing: bool = False
+) -> str:
+    """
+    Turns a Site Verification HttpError into something actionable.
+
+    A 400 means different things per call. While claiming ownership it usually
+    means Google cannot see the token yet, so waiting is the advice. While
+    requesting a token nothing has been published at all, and the same advice
+    would send the user looking for a DNS record that does not exist — there a
+    400 is a validation error about the property or the method.
+    """
+    try:
+        error_details = json.loads(e.content.decode("utf-8")).get("error", {})
+    except Exception:
+        error_details = {}
+    error_code = e.resp.status
+    error_message = error_details.get("message", str(e))
+
+    if error_code == 400:
+        if token_may_be_missing:
+            return (
+                f"Error {action} for {site_url}: {error_message}\n"
+                f"The token is usually not visible to Google yet. For a DNS method, confirm the "
+                f"record resolves first."
+            )
+        return (
+            f"Error {action} for {site_url}: {error_message}\n"
+            f"Check that the property id and the verification method match: domain properties "
+            f"take DNS_TXT or DNS_CNAME, prefix properties take FILE or META."
+        )
+    if error_code == 403:
+        return (
+            f"Error {action} for {site_url}: permission denied. {error_message}\n"
+            f"If the saved token predates the siteverification scope, delete token.json "
+            f"(or run the reauthenticate tool) and consent again."
+        )
+    if error_code == 404:
+        return f"Error {action} for {site_url}: not found. {error_message}"
+    return f"Error {action} for {site_url} (HTTP {error_code}): {error_message}"
+
 
 @mcp.tool()
 async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:

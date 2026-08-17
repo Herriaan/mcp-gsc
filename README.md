@@ -1,6 +1,6 @@
 # Google Search Console MCP server for SEOs
 
-> **April 2026 (v0.3.0):** Coming to the **Cursor Marketplace** — one-click install with bundled SEO skills. Also: token storage moved to user config dir (survives `uvx` upgrades), all data tools now return structured JSON, and 39 new unit tests. See the [Changelog](#changelog) for details.
+> **August 2026 (v0.3.1):** New `get_verification_token` and `verify_site` tools close the gap after `add_site` — no more finishing property verification by hand in the Search Console UI. See the [Changelog](#changelog) for details.
 
 A Model Context Protocol (MCP) server that connects [Google Search Console](https://search.google.com/search-console/about) (GSC) to AI assistants, allowing you to analyze your SEO data through natural language conversations. Works with **Claude**, **Cursor**, **Codex**, **Gemini CLI**, **Antigravity**, and any other MCP-compatible client. This integration gives you access to property information, search analytics, URL inspection, and sitemap management—all through simple chat.
 
@@ -72,6 +72,8 @@ Here's what you can ask your AI assistant to do once you've set up this integrat
 | `list_properties`               | Shows all your GSC properties                               | Nothing - just ask!                                             |
 | `get_site_details`              | Shows details about a specific site                         | Your website URL                                                |
 | `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
+| `get_verification_token`        | Gets the token that proves ownership of a property          | Your property, plus optional method (default `DNS_TXT`)         |
+| `verify_site`                   | Claims ownership once that token is published                | Your property, plus the same method                             |
 | `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL, time period, and optional `row_limit` (default 20, max 500) |
 | `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
@@ -80,7 +82,7 @@ Here's what you can ask your AI assistant to do once you've set up this integrat
 | `get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
 | `submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
 
-*For a complete list of all 20 available tools and their detailed descriptions, ask your AI assistant to "list tools" after setup.*
+*For a complete list of all 22 available tools and their detailed descriptions, ask your AI assistant to "list tools" after setup.*
 
 ---
 
@@ -105,20 +107,25 @@ Set `GSC_SKIP_OAUTH` to "true", "1", or "yes" to skip OAuth authentication and u
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a Google Cloud account if you don't have one
 2. Create a new project or select an existing one
 3. [Enable the Search Console API](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com) for your project
-4. [Add scope](https://console.cloud.google.com/auth/scopes) `https://www.googleapis.com/auth/webmasters` to your project
-5. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
-6. Click "Create Credentials" and select "OAuth client ID"
-7. Configure the OAuth consent screen
-8. For application type, select "Desktop app"
-9. Give your OAuth client a name and click "Create"
-10. Download the client secrets JSON file (it will be named something like `client_secrets.json`)
-11. Place this file in the same directory as the script or set the `GSC_OAUTH_CLIENT_SECRETS_FILE` environment variable to point to its location
+4. [Enable the Site Verification API](https://console.cloud.google.com/apis/library/siteverification.googleapis.com) for your project — required for `get_verification_token` and `verify_site`; the Search Console API alone does not cover those calls, and a project that skips this step gets a `SERVICE_DISABLED` error the first time one of those tools runs
+5. [Add scopes](https://console.cloud.google.com/auth/scopes) `https://www.googleapis.com/auth/webmasters` and `https://www.googleapis.com/auth/siteverification` to your project
+6. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
+7. Click "Create Credentials" and select "OAuth client ID"
+8. Configure the OAuth consent screen
+9. For application type, select "Desktop app"
+10. Give your OAuth client a name and click "Create"
+11. Download the client secrets JSON file (it will be named something like `client_secrets.json`)
+12. Place this file in the same directory as the script or set the `GSC_OAUTH_CLIENT_SECRETS_FILE` environment variable to point to its location
 
 When you run the tool for the first time with OAuth authentication, it will open a browser window asking you to sign in to your Google account and authorize the application. After authorization, the tool will save the token for future use.
+
+If you set this up before v0.3.1, your project has the Search Console API but not the Site Verification API, and your saved `token.json` only carries the old scope. Enable the API above, then delete `token.json` (or run the `reauthenticate` tool) to pick up the new scope on the next run.
 
 ##### 2. Service Account Authentication
 
 This method uses a service account, which is useful for automated scripts or when you don't want to use your personal Google account. This requires adding the service account as a user in Google Search Console.
+
+`get_verification_token` and `verify_site` are OAuth-only: the Site Verification API ties ownership to a Google account, and a service account cannot own a verification token. Use OAuth authentication for those two tools; the rest of the toolset works the same under either method.
 
 ###### Setup Instructions:
 
@@ -343,6 +350,8 @@ Here are some powerful prompts you can use with each tool:
 | `list_properties`               | "List all my GSC properties and tell me which ones have the most pages indexed."                 |
 | `get_site_details`              | "Analyze the verification status of mywebsite.com and explain what the ownership details mean."  |
 | `add_site`                      | "Add my new website https://mywebsite.com to Search Console and verify its status."              |
+| `get_verification_token`        | "Give me the DNS TXT value I need to prove I own sc-domain:mywebsite.com."                       |
+| `verify_site`                   | "The TXT record resolves now — claim ownership of sc-domain:mywebsite.com."                      |
 | `delete_site`                   | "Remove the old test site https://test.mywebsite.com from Search Console."                       |
 | `get_search_analytics`          | "Show me the top 20 search queries for mywebsite.com in the last 30 days, highlight any with CTR below 2%, and suggest title improvements." |
 | `get_performance_overview`      | "Create a visual performance overview of mywebsite.com for the last 28 days, identify any unusual drops or spikes, and explain possible causes." |
@@ -437,7 +446,7 @@ Remember that most issues have been encountered by others before, and there's us
 
 ## Safety: Destructive Operations
 
-By default, the tools that can **permanently modify your GSC account** (`add_site`, `delete_site`, `delete_sitemap`) are disabled. If you ask the AI to "clean things up" or "remove old properties", it will explain the safety restriction instead of deleting data.
+By default, the tools that can **permanently modify your GSC account** (`add_site`, `delete_site`, `delete_sitemap`, `verify_site`) are disabled. If you ask the AI to "clean things up" or "remove old properties", it will explain the safety restriction instead of deleting data.
 
 To enable these tools, set the `GSC_ALLOW_DESTRUCTIVE` environment variable:
 
@@ -531,6 +540,21 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ---
 
 ## Changelog
+
+### [0.3.1] — August 2026
+
+#### Added
+- **Property verification:** Two new tools, `get_verification_token` and `verify_site`, close the gap after `add_site`. A property created with `add_site` stays on `siteUnverifiedUser`, and claiming ownership runs through the Site Verification API rather than the Search Console API, so until now the only route was verifying by hand in the Search Console UI. Supports `DNS_TXT` (default) and `DNS_CNAME` for domain properties, `FILE` and `META` for prefix properties. `get_verification_token` is read-only; `verify_site` claims ownership and is gated behind `GSC_ALLOW_DESTRUCTIVE` like `add_site` and `delete_site`. (@herriaan)
+- **Site Verification scope:** The OAuth grant now also requests `https://www.googleapis.com/auth/siteverification`. Service accounts cannot use the two new tools — ownership ties to a Google account, not a service account. (@herriaan)
+
+#### Fixed
+- **Silently under-scoped tokens:** A `token.json` saved before a scope was added is not expired, so it counted as valid and was reused — the first call to the newly scoped API then failed with an opaque 403. Credentials missing any required scope now trigger a fresh consent instead. (@herriaan)
+
+#### Upgrade note
+- Enable the [Site Verification API](https://console.cloud.google.com/apis/library/siteverification.googleapis.com) in your Google Cloud project — the Search Console API alone does not cover it, and skipping this step gets a `SERVICE_DISABLED` error the first time `get_verification_token` or `verify_site` runs. Existing installs also need to re-consent once: the saved `token.json` only carries the old scope, and this now happens on its own at the next call (deleting the token or running `reauthenticate` also works). (@herriaan)
+
+#### Tests
+- 11 new tests in `test_gsc_server.py`, following the existing module-reload pattern: scope enforcement, the Search Console → Site Verification identifier mapping, the `GSC_ALLOW_DESTRUCTIVE` gate on `verify_site`, and the split 400-error handling between the two tools. 48 of 50 tests pass; the 2 pre-existing failures are environment-dependent (`sys.stdin.isatty()` under a non-interactive test runner) and unrelated to this change. (@herriaan)
 
 ### [0.3.0] — April 2026
 
