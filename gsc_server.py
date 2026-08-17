@@ -73,13 +73,19 @@ if _raw_data_state not in ("all", "final"):
     )
 DATA_STATE = _raw_data_state
 
-SCOPES = [
-    "https://www.googleapis.com/auth/webmasters",
-    # Needed for get_verification_token/verify_site: confirming ownership of a
-    # property added with add_site runs through the Site Verification API,
-    # which the webmasters scope does not cover.
-    "https://www.googleapis.com/auth/siteverification",
-]
+SEARCH_CONSOLE_SCOPE = "https://www.googleapis.com/auth/webmasters"
+# Needed for get_verification_token/verify_site: confirming ownership of a
+# property added with add_site runs through the Site Verification API, which
+# the webmasters scope does not cover.
+SITE_VERIFICATION_SCOPE = "https://www.googleapis.com/auth/siteverification"
+
+# Requested together on a brand-new consent, so a first-time user gets both
+# tool families in one authorization. Existing per-service calls below ask
+# get_oauth_credentials for only the scope they actually need, so a token
+# saved before this scope existed keeps working for Search Console — see
+# get_oauth_credentials for why requiring the full list there would break
+# every existing tool for anyone upgrading with an old token.
+SCOPES = [SEARCH_CONSOLE_SCOPE, SITE_VERIFICATION_SCOPE]
 
 def get_gsc_service():
     """
@@ -114,16 +120,31 @@ def get_gsc_service():
         f"{', '.join([p for p in POSSIBLE_CREDENTIAL_PATHS[1:] if p])}"
     )
 
-def get_oauth_credentials():
+def get_oauth_credentials(required_scopes=None):
     """
-    Returns authorized OAuth credentials covering every scope in SCOPES.
+    Returns authorized OAuth credentials covering at least required_scopes.
 
-    A token saved before a scope was added stays valid (it is not expired), so
-    reusing it blindly means the first call to the newly scoped API fails with
-    an opaque 403. Credentials that miss any required scope are therefore
-    treated as unusable, which routes them through the same re-consent path
-    below as a missing or expired token.
+    required_scopes defaults to the full SCOPES list, which is right when
+    acquiring a brand-new consent (a first-time user should authorize
+    everything in one go) but wrong as a blanket requirement on every reuse
+    of a stored token: a token saved before SITE_VERIFICATION_SCOPE existed
+    lacks it forever until the user re-consents, and if every caller demanded
+    the full list, an old Search-Console-only token would fail has_scopes()
+    and force a RuntimeError in a headless MCP server for tools that never
+    needed the new scope in the first place. Each service getter below
+    therefore passes only the scope(s) it actually uses.
+
+    A token saved before a scope was added stays valid (it is not expired),
+    so reusing it blindly means the first call to the newly scoped API fails
+    with an opaque 403. Credentials missing a scope the current call actually
+    needs are therefore treated as unusable for that call, which routes them
+    through the same re-consent path below as a missing or expired token —
+    and that re-consent always requests the full SCOPES list, so one
+    re-authorization covers every tool going forward.
     """
+    if required_scopes is None:
+        required_scopes = SCOPES
+
     creds = None
 
     # Check if token file exists
@@ -133,8 +154,8 @@ def get_oauth_credentials():
             # scopes recorded in the file when the caller passes None. Passing
             # SCOPES here would silently overwrite whatever Google actually
             # granted with the scopes this version of the code wants, which
-            # makes the has_scopes(SCOPES) check below trivially true for
-            # every token file regardless of what was really authorized.
+            # makes the has_scopes() check below trivially true for every
+            # token file regardless of what was really authorized.
             creds = Credentials.from_authorized_user_file(TOKEN_FILE)
         except Exception as e:
             # If token file is corrupted, delete it
@@ -142,8 +163,8 @@ def get_oauth_credentials():
                 os.remove(TOKEN_FILE)
             creds = None
 
-    # A token granted under a narrower scope set cannot serve the new APIs.
-    if creds is not None and not creds.has_scopes(SCOPES):
+    # A token missing a scope this specific call needs cannot serve it.
+    if creds is not None and not creds.has_scopes(required_scopes):
         creds = None
 
     # If credentials don't exist or are invalid, get new ones
@@ -196,8 +217,12 @@ def get_oauth_credentials():
 def get_gsc_service_oauth():
     """
     Returns an authorized Search Console service object using OAuth.
+
+    Only requires SEARCH_CONSOLE_SCOPE: a token saved before
+    SITE_VERIFICATION_SCOPE existed must keep working for every tool that
+    only ever needed Search Console access.
     """
-    creds = get_oauth_credentials()
+    creds = get_oauth_credentials(required_scopes=[SEARCH_CONSOLE_SCOPE])
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
 
@@ -209,7 +234,7 @@ def get_site_verification_service():
     Search Console API, which is why SCOPES carries the siteverification scope.
     OAuth only: service accounts cannot own a verification token.
     """
-    creds = get_oauth_credentials()
+    creds = get_oauth_credentials(required_scopes=[SITE_VERIFICATION_SCOPE])
     return build("siteVerification", "v1", credentials=creds, cache_discovery=False)
 
 

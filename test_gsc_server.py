@@ -836,6 +836,79 @@ class TestSiteVerificationScopeIntegration(unittest.TestCase):
             self.assertTrue(creds.has_scopes(mod.SCOPES))
 
 
+class TestScopeUpgradeDoesNotBreakSearchConsole(unittest.TestCase):
+    """
+    Regression coverage for a real cross-model review finding: an earlier
+    version of get_oauth_credentials required the FULL SCOPES list (including
+    the new SITE_VERIFICATION_SCOPE) on every call, no matter which service
+    was being built. Every token saved before that scope existed — i.e. every
+    v0.3.0 install upgrading to this version — would fail that check, and in
+    a headless MCP server (non-tty) that meant a RuntimeError on the very
+    first Search Console call, breaking the entire existing toolset for the
+    sake of two new tools neither had asked for yet.
+    """
+
+    @staticmethod
+    def _write_token(path, scopes, expiry):
+        json.dump(
+            {
+                "token": "at",
+                "refresh_token": "rt",
+                "client_id": "cid",
+                "client_secret": "secret",
+                "scopes": scopes,
+                "expiry": expiry,
+            },
+            open(path, "w"),
+        )
+
+    def test_search_console_still_works_with_pre_upgrade_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._write_token(
+                token_path, ["https://www.googleapis.com/auth/webmasters"], future
+            )
+
+            env = {"GSC_SKIP_OAUTH": "false", "GSC_DATA_STATE": "all",
+                   "GSC_ALLOW_DESTRUCTIVE": "false", "GSC_CONFIG_DIR": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                if "gsc_server" in sys.modules:
+                    del sys.modules["gsc_server"]
+                import gsc_server as mod
+
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.build", return_value=MagicMock()) as build:
+                # Must NOT raise: a token with only the old scope is still
+                # good enough for the Search Console service specifically.
+                mod.get_gsc_service_oauth()
+
+            self.assertEqual(build.call_args.args[0], "searchconsole")
+
+    def test_site_verification_still_requires_reconsent_with_pre_upgrade_token(self):
+        """The other half of the fix: a request that genuinely needs the new
+        scope must still be refused a pre-upgrade token, not silently allowed
+        through because some other call site happened to accept it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._write_token(
+                token_path, ["https://www.googleapis.com/auth/webmasters"], future
+            )
+
+            env = {"GSC_SKIP_OAUTH": "false", "GSC_DATA_STATE": "all",
+                   "GSC_ALLOW_DESTRUCTIVE": "false", "GSC_CONFIG_DIR": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                if "gsc_server" in sys.modules:
+                    del sys.modules["gsc_server"]
+                import gsc_server as mod
+
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+                with self.assertRaises(RuntimeError):
+                    mod.get_site_verification_service()
+
+
 class TestSiteVerificationScope(unittest.TestCase):
 
     def test_scopes_include_siteverification(self):
