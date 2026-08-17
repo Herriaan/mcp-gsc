@@ -44,6 +44,8 @@ Here's what you can ask your AI assistant to do once you've set up this integrat
 | `list_properties`               | Shows all your GSC properties                               | Nothing - just ask!                                             |
 | `get_site_details`              | Shows details about a specific site                         | Your website URL                                                |
 | `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
+| `get_verification_token`        | Gets the token that proves ownership of a property          | Your property, plus optional method (default `DNS_TXT`)         |
+| `verify_site`                   | Claims ownership once that token is published               | Your property, plus the same method                             |
 | `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL, time period, and optional `row_limit` (default 20, max 500) |
 | `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
@@ -293,6 +295,8 @@ Here are some powerful prompts you can use with each tool:
 | `list_properties`               | "List all my GSC properties and tell me which ones have the most pages indexed."                 |
 | `get_site_details`              | "Analyze the verification status of mywebsite.com and explain what the ownership details mean."  |
 | `add_site`                      | "Add my new website https://mywebsite.com to Search Console and verify its status."              |
+| `get_verification_token`        | "Give me the DNS TXT value I need to prove I own sc-domain:mywebsite.com."                       |
+| `verify_site`                   | "The TXT record resolves now — claim ownership of sc-domain:mywebsite.com."                      |
 | `delete_site`                   | "Remove the old test site https://test.mywebsite.com from Search Console."                       |
 | `get_search_analytics`          | "Show me the top 20 search queries for mywebsite.com in the last 30 days, highlight any with CTR below 2%, and suggest title improvements." |
 | `get_performance_overview`      | "Create a visual performance overview of mywebsite.com for the last 28 days, identify any unusual drops or spikes, and explain possible causes." |
@@ -441,10 +445,17 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ### [0.2.2] — August 2026
 
 #### Added
-- **Site Verification scope:** The OAuth grant now also requests `https://www.googleapis.com/auth/siteverification` alongside `webmasters`. Without it, a property created with `add_site` stays on `siteUnverifiedUser` and ownership has to be confirmed by hand in the Search Console UI, because requesting a verification token is a Site Verification API call that the `webmasters` scope does not cover. (@herriaan)
+- **Property verification:** Two new tools, `get_verification_token` and `verify_site`, close the gap after `add_site`. A property created with `add_site` stays on `siteUnverifiedUser`, and claiming ownership runs through the Site Verification API rather than the Search Console API, so until now the only route was verifying by hand in the Search Console UI. Supports `DNS_TXT` (default) and `DNS_CNAME` for domain properties, `FILE` and `META` for prefix properties. (@herriaan)
+- **Site Verification scope:** The OAuth grant now also requests `https://www.googleapis.com/auth/siteverification`, which is what the two tools above need. (@herriaan)
+
+#### Fixed
+- **Silently under-scoped tokens:** A `token.json` saved before a scope was added is not expired, so it counted as valid and was reused — the first call to the newly scoped API then failed with an opaque 403. Credentials missing any required scope now trigger a fresh consent instead. (@herriaan)
 
 #### Upgrade note
-- Existing installs must re-consent once: the saved `token.json` only carries the old scope, so delete it (or run the `reauthenticate` tool) and complete the browser login again. (@herriaan)
+- Existing installs must re-consent once: the saved `token.json` only carries the old scope. This now happens on its own at the next call; deleting the token or running `reauthenticate` also works. (@herriaan)
+
+#### Tests
+- First tests in the repo: `python -m unittest discover -s tests` (stdlib only, no new dependency). Covers the scope check, the Search Console → Site Verification identifier mapping, and the request bodies of both new tools. (@herriaan)
 
 ---
 
