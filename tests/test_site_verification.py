@@ -14,6 +14,7 @@ Only external dependencies are mocked: the Google client library entry points
 under test are the real ones.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -190,6 +191,52 @@ class VerificationCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["body"]["site"]["identifier"], "example.com")
         self.assertIn("verified", result)
         self.assertIn("mail@katama.nl", result)
+
+
+@requires_gsc_server
+class VerificationErrorTests(unittest.IsolatedAsyncioTestCase):
+    """A 400 means something different depending on which call produced it."""
+
+    @staticmethod
+    def _http_error(status, message):
+        from googleapiclient.errors import HttpError
+
+        resp = mock.Mock()
+        resp.status = status
+        content = json.dumps({"error": {"message": message}}).encode("utf-8")
+        return HttpError(resp, content)
+
+    async def test_token_request_400_reports_validation_error(self):
+        """Nothing is published yet when fetching a token, so propagation advice
+        would send the user chasing a DNS record that does not exist."""
+        service = mock.Mock()
+        service.webResource.return_value.getToken.return_value.execute.side_effect = (
+            self._http_error(400, "Invalid verification method for this site type.")
+        )
+
+        with mock.patch.object(
+            gsc_server, "get_site_verification_service", return_value=service
+        ):
+            result = await gsc_server.get_verification_token(
+                "sc-domain:example.com", method="FILE"
+            )
+
+        self.assertIn("Invalid verification method", result)
+        self.assertNotIn("resolve", result)
+
+    async def test_verify_400_keeps_propagation_advice(self):
+        service = mock.Mock()
+        service.webResource.return_value.insert.return_value.execute.side_effect = (
+            self._http_error(400, "Token not found.")
+        )
+
+        with mock.patch.object(
+            gsc_server, "get_site_verification_service", return_value=service
+        ):
+            result = await gsc_server.verify_site("sc-domain:example.com")
+
+        self.assertIn("Token not found", result)
+        self.assertIn("resolve", result)
 
 
 if __name__ == "__main__":

@@ -79,20 +79,25 @@ Set `GSC_SKIP_OAUTH` to "true", "1", or "yes" to skip OAuth authentication and u
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a Google Cloud account if you don't have one
 2. Create a new project or select an existing one
 3. [Enable the Search Console API](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com) for your project
-4. [Add scope](https://console.cloud.google.com/auth/scopes) `https://www.googleapis.com/auth/webmasters` to your project
-5. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
-6. Click "Create Credentials" and select "OAuth client ID"
-7. Configure the OAuth consent screen
-8. For application type, select "Desktop app"
-9. Give your OAuth client a name and click "Create"
-10. Download the client secrets JSON file (it will be named something like `client_secrets.json`)
-11. Place this file in the same directory as the script or set the `GSC_OAUTH_CLIENT_SECRETS_FILE` environment variable to point to its location
+4. [Enable the Site Verification API](https://console.cloud.google.com/apis/library/siteverification.googleapis.com) for your project — required for `get_verification_token` and `verify_site`; the Search Console API alone does not cover those calls, and a project that skips this step gets a `SERVICE_DISABLED` error the first time one of those tools runs
+5. [Add scopes](https://console.cloud.google.com/auth/scopes) `https://www.googleapis.com/auth/webmasters` and `https://www.googleapis.com/auth/siteverification` to your project
+6. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
+7. Click "Create Credentials" and select "OAuth client ID"
+8. Configure the OAuth consent screen
+9. For application type, select "Desktop app"
+10. Give your OAuth client a name and click "Create"
+11. Download the client secrets JSON file (it will be named something like `client_secrets.json`)
+12. Place this file in the same directory as the script or set the `GSC_OAUTH_CLIENT_SECRETS_FILE` environment variable to point to its location
 
 When you run the tool for the first time with OAuth authentication, it will open a browser window asking you to sign in to your Google account and authorize the application. After authorization, the tool will save the token for future use.
+
+If you set this up before v0.2.2, your project has the Search Console API but not the Site Verification API, and your saved `token.json` only carries the old scope. Enable the API above, then delete `token.json` (or run the `reauthenticate` tool) to pick up the new scope on the next run.
 
 ##### 2. Service Account Authentication
 
 This method uses a service account, which is useful for automated scripts or when you don't want to use your personal Google account. This requires adding the service account as a user in Google Search Console.
+
+`get_verification_token` and `verify_site` are OAuth-only: the Site Verification API ties ownership to a Google account, and a service account cannot own a verification token. Use OAuth authentication for those two tools; the rest of the toolset works the same under either method.
 
 ###### Setup Instructions:
 

@@ -384,13 +384,23 @@ async def verify_site(site_url: str, method: str = "DNS_TXT") -> str:
             lines.append(f"Owners: {', '.join(owners)}")
         return "\n".join(lines)
     except HttpError as e:
-        return _verification_http_error(e, site_url, "verifying site")
+        return _verification_http_error(e, site_url, "verifying site", token_may_be_missing=True)
     except Exception as e:
         return f"Error verifying site: {str(e)}"
 
 
-def _verification_http_error(e: HttpError, site_url: str, action: str) -> str:
-    """Turns a Site Verification HttpError into something actionable."""
+def _verification_http_error(
+    e: HttpError, site_url: str, action: str, token_may_be_missing: bool = False
+) -> str:
+    """
+    Turns a Site Verification HttpError into something actionable.
+
+    A 400 means different things per call. While claiming ownership it usually
+    means Google cannot see the token yet, so waiting is the advice. While
+    requesting a token nothing has been published at all, and the same advice
+    would send the user looking for a DNS record that does not exist — there a
+    400 is a validation error about the property or the method.
+    """
     try:
         error_details = json.loads(e.content.decode("utf-8")).get("error", {})
     except Exception:
@@ -399,10 +409,16 @@ def _verification_http_error(e: HttpError, site_url: str, action: str) -> str:
     error_message = error_details.get("message", str(e))
 
     if error_code == 400:
+        if token_may_be_missing:
+            return (
+                f"Error {action} for {site_url}: {error_message}\n"
+                f"The token is usually not visible to Google yet. For a DNS method, confirm the "
+                f"record resolves first."
+            )
         return (
             f"Error {action} for {site_url}: {error_message}\n"
-            f"The token is usually not visible to Google yet. For a DNS method, confirm the "
-            f"record resolves first."
+            f"Check that the property id and the verification method match: domain properties "
+            f"take DNS_TXT or DNS_CNAME, prefix properties take FILE or META."
         )
     if error_code == 403:
         return (
