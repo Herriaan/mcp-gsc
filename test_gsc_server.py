@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, PropertyMock
 
 
@@ -737,6 +737,104 @@ class TestStdoutClean(unittest.TestCase):
 #   GSC_ALLOW_DESTRUCTIVE like the other ownership-changing tools
 # - a 400 means different things depending on which call produced it
 # ---------------------------------------------------------------------------
+
+class TestSiteVerificationScopeIntegration(unittest.TestCase):
+    """
+    Exercises the real google.oauth2.credentials.Credentials, not a mock.
+
+    from_authorized_user_file(filename, scopes) is documented as loading
+    scopes from the file, but only when the caller does NOT pass a scopes
+    argument — Credentials.from_authorized_user_info does
+    `if scopes is None and "scopes" in info: scopes = info.get("scopes")`.
+    Passing SCOPES explicitly (the original code) makes it silently discard
+    whatever the file actually recorded and overwrite it with SCOPES, which
+    makes has_scopes(SCOPES) trivially true for any token file regardless of
+    what Google really granted. A test that mocks from_authorized_user_file
+    itself (see TestSiteVerificationScope above) can't see this: the mock
+    just returns whatever creds object the test hands it.
+    """
+
+    @staticmethod
+    def _write_token(path, scopes, expiry):
+        json.dump(
+            {
+                "token": "at",
+                "refresh_token": "rt",
+                "client_id": "cid",
+                "client_secret": "secret",
+                "scopes": scopes,
+                "expiry": expiry,
+            },
+            open(path, "w"),
+        )
+
+    def test_real_token_with_old_scope_is_not_silently_reused(self):
+        """
+        Gives the token a future expiry so `valid` is True on its own — the
+        only way this can still fail is through the refresh/no-refresh-token
+        branch, which requires `expired` to be True. With a future expiry
+        that branch is never entered, so if the fix is missing the buggy
+        has_scopes(SCOPES) check would return the reused (falsely "complete")
+        credentials here instead of raising. A token without an explicit
+        expiry auto-expires immediately, which would route this through the
+        refresh path instead and mask the actual bug with a real (and, with
+        fake credentials, always-failing) network call — see the sibling
+        test_real_token_with_all_scopes_is_reused for why that path is worth
+        avoiding in a test that is supposed to run without credentials.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._write_token(
+                token_path, ["https://www.googleapis.com/auth/webmasters"], future
+            )
+
+            env = {"GSC_SKIP_OAUTH": "false", "GSC_DATA_STATE": "all",
+                   "GSC_ALLOW_DESTRUCTIVE": "false", "GSC_CONFIG_DIR": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                if "gsc_server" in sys.modules:
+                    del sys.modules["gsc_server"]
+                import gsc_server as mod
+
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+                # Non-tty sandbox: a credential the scope check correctly
+                # discarded takes the "cannot refresh" RuntimeError path,
+                # same as a missing token would.
+                with self.assertRaises(RuntimeError):
+                    mod.get_oauth_credentials()
+
+    def test_real_token_with_all_scopes_is_reused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            json.dump(
+                {
+                    "token": "at",
+                    "refresh_token": "rt",
+                    "client_id": "cid",
+                    "client_secret": "secret",
+                    "scopes": [
+                        "https://www.googleapis.com/auth/webmasters",
+                        "https://www.googleapis.com/auth/siteverification",
+                    ],
+                    "expiry": future,
+                },
+                open(token_path, "w"),
+            )
+
+            env = {"GSC_SKIP_OAUTH": "false", "GSC_DATA_STATE": "all",
+                   "GSC_ALLOW_DESTRUCTIVE": "false", "GSC_CONFIG_DIR": tmpdir}
+            with patch.dict(os.environ, env, clear=False):
+                if "gsc_server" in sys.modules:
+                    del sys.modules["gsc_server"]
+                import gsc_server as mod
+
+            with patch.object(mod, "TOKEN_FILE", token_path):
+                creds = mod.get_oauth_credentials()
+
+            self.assertTrue(creds.has_scopes(mod.SCOPES))
+
 
 class TestSiteVerificationScope(unittest.TestCase):
 

@@ -129,7 +129,13 @@ def get_oauth_credentials():
     # Check if token file exists
     if os.path.exists(TOKEN_FILE):
         try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            # No `scopes` argument: from_authorized_user_info only reads the
+            # scopes recorded in the file when the caller passes None. Passing
+            # SCOPES here would silently overwrite whatever Google actually
+            # granted with the scopes this version of the code wants, which
+            # makes the has_scopes(SCOPES) check below trivially true for
+            # every token file regardless of what was really authorized.
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE)
         except Exception as e:
             # If token file is corrupted, delete it
             if os.path.exists(TOKEN_FILE):
