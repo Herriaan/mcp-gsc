@@ -56,7 +56,14 @@ if _raw_data_state not in ("all", "final"):
     )
 DATA_STATE = _raw_data_state
 
-SCOPES = ["https://www.googleapis.com/auth/webmasters"]
+SCOPES = [
+    "https://www.googleapis.com/auth/webmasters",
+    # Needed to request a verification token and confirm ownership of a new
+    # property via the Site Verification API. Without it a property added with
+    # add_site stays stuck on siteUnverifiedUser and has to be verified by hand
+    # in the Search Console UI.
+    "https://www.googleapis.com/auth/siteverification",
+]
 
 def get_gsc_service():
     """

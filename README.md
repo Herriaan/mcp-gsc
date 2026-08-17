@@ -438,6 +438,16 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ---
 
+### [0.2.2] — August 2026
+
+#### Added
+- **Site Verification scope:** The OAuth grant now also requests `https://www.googleapis.com/auth/siteverification` alongside `webmasters`. Without it, a property created with `add_site` stays on `siteUnverifiedUser` and ownership has to be confirmed by hand in the Search Console UI, because requesting a verification token is a Site Verification API call that the `webmasters` scope does not cover. (@herriaan)
+
+#### Upgrade note
+- Existing installs must re-consent once: the saved `token.json` only carries the old scope, so delete it (or run the `reauthenticate` tool) and complete the browser login again. (@herriaan)
+
+---
+
 ### [0.1.0] — Initial release
 
 - 19 tools covering property management, search analytics, URL inspection, and sitemap management
