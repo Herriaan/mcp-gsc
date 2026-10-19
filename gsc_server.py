@@ -35,7 +35,62 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("gsc-server")
+# Interactive OAuth (a browser login via run_local_server) is only allowed on
+# the stdio entry from a terminal. Every HTTP entry point switches it off for
+# good: a shared service must never block on, or replace the token through, a
+# login nobody is watching.
+_INTERACTIVE_AUTH = True
+
+
+def _allowed_http_hosts(port):
+    """The exact Host values the HTTP service accepts, on /mcp and /health alike."""
+    return [f"127.0.0.1:{port}", f"localhost:{port}"]
+
+
+class _GscFastMCP(FastMCP):
+    """
+    FastMCP whose HTTP apps are always the read-only, host-checked variant.
+
+    Whoever builds an HTTP app (main(), a test, or an outside caller using
+    mcp.streamable_http_app() or mcp.sse_app() directly) gets the read-only
+    tool list, the exact Host check and no interactive OAuth, with or without
+    configure_streamable_http() having run first.
+    """
+
+    def _prepare_http(self):
+        global _INTERACTIVE_AUTH
+        _INTERACTIVE_AUTH = False
+        self.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=_allowed_http_hosts(self.settings.port),
+            allowed_origins=[],
+        )
+        _restrict_to_read_only(self)
+
+    def streamable_http_app(self):
+        self._prepare_http()
+        return super().streamable_http_app()
+
+    def sse_app(self, mount_path=None):
+        self._prepare_http()
+        return super().sse_app(mount_path)
+
+
+mcp = _GscFastMCP("gsc-server")
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request):
+    """
+    Liveness check for the HTTP service. Custom routes bypass the transport
+    security middleware, so this route checks the Host itself, against the
+    same exact list as /mcp; anything else gets 421 like /mcp would.
+    """
+    from starlette.responses import JSONResponse, Response
+
+    if request.headers.get("host") not in _allowed_http_hosts(mcp.settings.port):
+        return Response("Invalid Host header", status_code=421)
+    return JSONResponse({"status": "ok"})
 
 
 def _run_in_worker(fn):
@@ -315,8 +370,8 @@ def get_oauth_credentials(required_scopes=None):
     The token file is never deleted. Reading, refreshing and writing happen
     under _token_lock(), and the file is re-read inside the lock, so a caller
     that waited for another caller's refresh simply picks up the new token.
-    Without a terminal (MCP stdio or streamable-http) an unusable token makes
-    the call fail with a TokenError that says why. With a terminal, a new
+    Without a terminal (MCP stdio), and always in HTTP mode, an unusable token
+    makes the call fail with a TokenError that says why. With a terminal, a new
     consent replaces the file only after the login succeeded.
     """
     if required_scopes is None:
@@ -330,6 +385,15 @@ def get_oauth_credentials(required_scopes=None):
     # IMPORTANT: When running as MCP server (stdio), run_local_server() blocks
     # forever because no browser can open. Only allow interactive OAuth when
     # running directly from terminal (stdin is a TTY).
+    if not _INTERACTIVE_AUTH:
+        raise TokenError(
+            f"OAuth token cannot be used: {reason}.\n"
+            f"Token file: {TOKEN_FILE}\n"
+            "This shared HTTP service never starts a login itself. Renew the token "
+            "through the stdio admin entry google-search-console-beheer (tool "
+            "reauthenticate), which writes a new token to the file above; the "
+            "service picks it up on the next call."
+        )
     if not sys.stdin.isatty():
         raise TokenError(
             f"OAuth token cannot be used: {reason}.\n"
@@ -1957,12 +2021,14 @@ def configure_streamable_http(server, host: str, port: int):
     refused), and only the read-only tools registered. FASTMCP_* environment
     variables are not used: settings are set here explicitly.
     """
+    global _INTERACTIVE_AUTH
+    _INTERACTIVE_AUTH = False
     server.settings.host = host
     server.settings.port = port
     server.settings.stateless_http = True
     server.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[f"127.0.0.1:{port}", f"localhost:{port}"],
+        allowed_hosts=_allowed_http_hosts(port),
         allowed_origins=[],
     )
     _restrict_to_read_only(server)

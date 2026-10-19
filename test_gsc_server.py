@@ -1473,11 +1473,6 @@ class TestEventLoopNotBlocked(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(ticks, 10)
 
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestTokenLockWithoutFcntl(unittest.TestCase):
     """Windows has no fcntl: the lock falls back to msvcrt and fchmod is skipped."""
 
@@ -1513,3 +1508,117 @@ class TestTokenLockWithoutFcntl(unittest.TestCase):
                     mod.os.fchmod = saved
             with open(path) as f:
                 self.assertEqual(f.read(), '{"token": "x"}')
+
+
+# ---------------------------------------------------------------------------
+# Every HTTP entry point is read-only, /health checks the Host, and HTTP mode
+# never starts an interactive OAuth flow
+# ---------------------------------------------------------------------------
+
+class TestHttpEntryPointsWithoutMain(unittest.IsolatedAsyncioTestCase):
+    """streamable_http_app() and sse_app() must be safe even when main() never ran."""
+
+    async def test_streamable_http_app_without_main_lists_only_read_only_tools(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        mod.mcp.streamable_http_app()
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, set(mod.READ_ONLY_TOOLS))
+
+    async def test_sse_app_without_main_lists_only_read_only_tools(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        mod.mcp.sse_app()
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, set(mod.READ_ONLY_TOOLS))
+
+    async def test_streamable_http_app_without_main_sets_exact_host_check(self):
+        mod = _load_module()
+        mod.mcp.settings.port = 18899
+        mod.mcp.streamable_http_app()
+        sec = mod.mcp.settings.transport_security
+        self.assertTrue(sec.enable_dns_rebinding_protection)
+        self.assertEqual(sorted(sec.allowed_hosts), ["127.0.0.1:18899", "localhost:18899"])
+        self.assertEqual(sec.allowed_origins, [])
+
+    async def test_http_entry_point_turns_interactive_auth_off(self):
+        mod = _load_module()
+        self.assertTrue(mod._INTERACTIVE_AUTH)
+        mod.mcp.streamable_http_app()
+        self.assertFalse(mod._INTERACTIVE_AUTH)
+
+    async def test_stdio_keeps_interactive_auth(self):
+        mod = _load_module()
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("MCP_TRANSPORT", None)
+        with patch.dict(os.environ, env, clear=True), patch.object(mod.mcp, "run"):
+            mod.main()
+        self.assertTrue(mod._INTERACTIVE_AUTH)
+
+
+class TestHealthRoute(unittest.TestCase):
+
+    def _client(self, port=18897):
+        from starlette.testclient import TestClient
+        mod = _load_module()
+        mod.configure_streamable_http(mod.mcp, "127.0.0.1", port)
+        return TestClient(mod.mcp.streamable_http_app())
+
+    def test_health_with_allowed_hosts_is_200(self):
+        client = self._client()
+        for host in ("127.0.0.1:18897", "localhost:18897"):
+            r = client.get("/health", headers={"Host": host})
+            self.assertEqual(r.status_code, 200, host)
+
+    def test_health_with_foreign_host_is_421(self):
+        client = self._client()
+        for host in ("evil.example", "evil.example:18897", "127.0.0.1:9999",
+                     "127.0.0.1", "localhost"):
+            r = client.get("/health", headers={"Host": host})
+            self.assertEqual(r.status_code, 421, host)
+
+
+class TestHttpModeNeverInteractiveOAuth(unittest.TestCase):
+
+    def _http_module(self, tmpdir):
+        mod = _load_oauth_module(tmpdir)
+        mod.configure_streamable_http(mod.mcp, "127.0.0.1", 18897)
+        return mod
+
+    def test_missing_token_with_tty_raises_and_starts_no_flow(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._http_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(secrets_path, "w") as f:
+                f.write("{}")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow, \
+                 patch("sys.stdin.isatty", return_value=True):
+                with self.assertRaises(mod.TokenError) as ctx:
+                    mod.get_oauth_credentials()
+            flow.from_client_secrets_file.assert_not_called()
+            self.assertFalse(os.path.exists(token_path))
+            msg = str(ctx.exception)
+            self.assertIn(token_path, msg)
+            self.assertIn("google-search-console-beheer", msg)
+            self.assertIn("reauthenticate", msg)
+            self.assertNotIn("python gsc_server.py", msg)
+
+    def test_unusable_token_with_tty_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._http_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write("not json{")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow, \
+                 patch("sys.stdin.isatty", return_value=True):
+                with self.assertRaises(mod.TokenError):
+                    mod.get_oauth_credentials()
+            flow.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(f.read(), "not json{")
+
+
+if __name__ == "__main__":
+    unittest.main()

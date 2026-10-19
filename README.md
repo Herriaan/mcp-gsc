@@ -484,6 +484,9 @@ What streamable-http mode does:
 - **Stateless.** No `mcp-session-id`; every request stands on its own, so a restart of the server needs no reconnect in the client. A call that is running during the restart fails.
 - **Host and Origin check.** Only `Host: 127.0.0.1:<port>` and `Host: localhost:<port>` are accepted (anything else gets `421`). Requests without an `Origin` header pass; any `Origin` is refused with `403`. Settings are passed to the SDK explicitly; `FASTMCP_*` environment variables are not used.
 - **Read-only tool set.** A shared service serves many sessions, so only these 14 tools are registered: `list_properties`, `get_search_analytics`, `get_site_details`, `get_sitemaps`, `inspect_url_enhanced`, `batch_url_inspection`, `check_indexing_issues`, `get_performance_overview`, `get_advanced_search_analytics`, `compare_search_periods`, `get_search_by_page_query`, `list_sitemaps_enhanced`, `get_sitemap_details`, `get_creator_info`. Not available over HTTP, whatever `GSC_ALLOW_DESTRUCTIVE` says: `add_site`, `delete_site`, `verify_site`, `get_verification_token` (verification flow), `submit_sitemap`, `delete_sitemap`, `manage_sitemaps` (mixes read and write actions; use `list_sitemaps_enhanced` and `get_sitemap_details`) and `reauthenticate`. Use a stdio instance for those.
+- **`GET /health`.** Returns `{"status": "ok"}`. Custom routes sit outside the SDK's transport security, so `/health` checks the Host itself against the same two values; a foreign Host gets `421` here too.
+- **Every HTTP entry point is read-only.** The checks above are applied by `mcp.streamable_http_app()` and `mcp.sse_app()` themselves, not only by `main()`, so code that builds the app directly gets the same read-only, host-checked server.
+- **No interactive login.** In HTTP mode an unusable token never starts a browser login, even with a terminal attached. The call fails with an error naming the token file and pointing to a stdio admin instance (`reauthenticate`) to renew it.
 - **Concurrent calls.** Every tool runs its whole synchronous chain (credentials, service, request, follow-up pages) in a worker thread, so one slow Google call or token refresh does not stall other requests.
 
 The tool list is `READ_ONLY_TOOLS` in `gsc_server.py`; a test fails when a new tool is added without being classified.
@@ -558,6 +561,8 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 #### Added
 - **streamable-http transport:** `MCP_TRANSPORT=streamable-http` runs the server as one shared, stateless HTTP service (`/mcp`) with an explicit Host and Origin check (`127.0.0.1:<port>`/`localhost:<port>`, no Origin allowed). (@herriaan)
+- **`/health` with its own Host check** (`421` for a foreign Host, like `/mcp`). (@herriaan)
+- **HTTP safety outside `main()`:** `streamable_http_app()` and `sse_app()` apply the read-only tool set, the exact Host check and the no-interactive-login rule themselves. (@herriaan)
 - **Read-only tool set over HTTP:** in streamable-http mode only the 14 tools on `READ_ONLY_TOOLS` are registered; add/delete/verify, sitemap submit/delete, `manage_sitemaps` and `reauthenticate` stay stdio-only. (@herriaan)
 
 #### Changed
