@@ -463,21 +463,34 @@ If you never use add/delete operations, you don't need to do anything — your e
 
 The standard setup above runs the server locally on your machine. This section is **only for users who want to run it on a remote server, in a container, or share it with a team** — existing local users don't need any of this.
 
-### HTTP Transport
+### HTTP Transport (streamable-http, read-only)
 
-By default the server communicates over stdio (standard input/output), which only works locally. To run it as a network server, set the `MCP_TRANSPORT` environment variable:
+By default the server communicates over stdio (standard input/output), which only works locally. To run it as one shared network service, set `MCP_TRANSPORT=streamable-http`:
 
 ```bash
-MCP_TRANSPORT=sse MCP_HOST=0.0.0.0 MCP_PORT=3001 python gsc_server.py
+MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=3001 python gsc_server.py
 ```
 
-Your MCP client then connects to `http://your-server:3001/sse` instead of launching the process locally.
+Your MCP client then connects to `http://127.0.0.1:3001/mcp` (type `http`) instead of launching the process locally.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Set to `sse` for network/remote use |
-| `MCP_HOST` | `127.0.0.1` | Host to bind (use `0.0.0.0` for all interfaces) |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http`. `sse` is no longer supported; any other value stops the server with an error |
+| `MCP_HOST` | `127.0.0.1` | Host to bind |
 | `MCP_PORT` | `3001` | Port to bind |
+
+What streamable-http mode does:
+
+- **Stateless.** No `mcp-session-id`; every request stands on its own, so a restart of the server needs no reconnect in the client. A call that is running during the restart fails.
+- **Host and Origin check.** Only `Host: 127.0.0.1:<port>` and `Host: localhost:<port>` are accepted (anything else gets `421`). Requests without an `Origin` header pass; any `Origin` is refused with `403`. Settings are passed to the SDK explicitly; `FASTMCP_*` environment variables are not used.
+- **Read-only tool set.** A shared service serves many sessions, so only these 14 tools are registered: `list_properties`, `get_search_analytics`, `get_site_details`, `get_sitemaps`, `inspect_url_enhanced`, `batch_url_inspection`, `check_indexing_issues`, `get_performance_overview`, `get_advanced_search_analytics`, `compare_search_periods`, `get_search_by_page_query`, `list_sitemaps_enhanced`, `get_sitemap_details`, `get_creator_info`. Not available over HTTP, whatever `GSC_ALLOW_DESTRUCTIVE` says: `add_site`, `delete_site`, `verify_site`, `get_verification_token` (verification flow), `submit_sitemap`, `delete_sitemap`, `manage_sitemaps` (mixes read and write actions; use `list_sitemaps_enhanced` and `get_sitemap_details`) and `reauthenticate`. Use a stdio instance for those.
+- **Concurrent calls.** Every tool runs its whole synchronous chain (credentials, service, request, follow-up pages) in a worker thread, so one slow Google call or token refresh does not stall other requests.
+
+The tool list is `READ_ONLY_TOOLS` in `gsc_server.py`; a test fails when a new tool is added without being classified.
+
+### OAuth token handling
+
+The OAuth token (`token.json` in the config directory, `GSC_CONFIG_DIR` to override) is never deleted by the server. An unreadable token or a failed refresh makes the call fail with an error that names the file and the cause; the file stays in place. Refreshed tokens are written atomically (a unique temp file in the same directory with mode `0600`, then `os.replace`), and every read-refresh-write runs under an `fcntl` lock on `token.json.lock`, re-reading the token inside the lock. Several processes (a shared HTTP service plus a stdio instance) can therefore use the same token safely. `reauthenticate` (stdio only) replaces the token only after the new login succeeded.
 
 ### Docker
 
@@ -490,9 +503,9 @@ docker build -t mcp-gsc .
 # Run locally (stdio mode — for testing)
 docker run -v /path/to/client_secrets.json:/app/client_secrets.json mcp-gsc
 
-# Run as a network server (SSE mode — for remote use)
+# Run as a network server (streamable-http, read-only tools)
 docker run \
-  -e MCP_TRANSPORT=sse \
+  -e MCP_TRANSPORT=streamable-http \
   -e MCP_HOST=0.0.0.0 \
   -e MCP_PORT=3001 \
   -e GSC_CREDENTIALS_PATH=/app/credentials.json \
@@ -503,7 +516,7 @@ docker run \
 
 ### Cloud Platforms
 
-The Docker image works on any container platform. Set `MCP_TRANSPORT=sse`, `MCP_HOST=0.0.0.0`, and inject credentials via environment variables or mounted secrets:
+The Docker image works on any container platform. Set `MCP_TRANSPORT=streamable-http`, `MCP_HOST=0.0.0.0`, and inject credentials via environment variables or mounted secrets. Note that the Host check only accepts `127.0.0.1:<port>` and `localhost:<port>`, so a public hostname needs a reverse proxy that rewrites the Host header:
 
 - **Railway** — connect your repo, set env vars in the dashboard
 - **Render** — deploy as a Web Service, set env vars under Environment
@@ -540,6 +553,25 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ---
 
 ## Changelog
+
+### [Unreleased] — October 2026
+
+#### Added
+- **streamable-http transport:** `MCP_TRANSPORT=streamable-http` runs the server as one shared, stateless HTTP service (`/mcp`) with an explicit Host and Origin check (`127.0.0.1:<port>`/`localhost:<port>`, no Origin allowed). (@herriaan)
+- **Read-only tool set over HTTP:** in streamable-http mode only the 14 tools on `READ_ONLY_TOOLS` are registered; add/delete/verify, sitemap submit/delete, `manage_sitemaps` and `reauthenticate` stay stdio-only. (@herriaan)
+
+#### Changed
+- **Tools run in a worker thread:** each tool's whole synchronous chain runs via `asyncio.to_thread`, so a slow Google call or token refresh no longer blocks the event loop. (@herriaan)
+- **mcp SDK pinned to exactly 1.30.0** in `pyproject.toml`, `requirements.txt` and `uv.lock`. (@herriaan)
+
+#### Removed
+- **SSE transport:** `MCP_TRANSPORT=sse` crashed with a `TypeError` (`FastMCP.run()` takes no `host`/`port`); it now stops with a clear error pointing to `streamable-http`. (@herriaan)
+
+#### Fixed
+- **Token never deleted:** an unreadable `token.json`, a failed refresh or `reauthenticate` used to delete the token file, which took the server down for every client. The file now stays; the call fails with a clear error, and `reauthenticate` replaces the token only after a successful new login. Token writes are atomic (temp file, mode `0600`, `os.replace`) under an `fcntl` lock on `token.json.lock`. (@herriaan)
+
+#### Tests
+- 18 new tests (72 in total): transport settings, read-only tool list and blocked write calls over HTTP, token safety (corrupt file, failed refresh, concurrent refresh, atomic `0600` write, reauthenticate keeps the token), and event-loop concurrency with a slow Google call and a slow token refresh. (@herriaan)
 
 ### [0.3.1] — August 2026
 
