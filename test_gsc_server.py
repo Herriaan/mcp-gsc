@@ -661,7 +661,7 @@ class TestSafetyGuards(unittest.IsolatedAsyncioTestCase):
 
 class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
 
-    async def test_deletes_token_file(self):
+    async def test_replaces_token_only_after_successful_login(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             token_path = os.path.join(tmpdir, "token.json")
             open(token_path, "w").write('{"old": "token"}')
@@ -685,15 +685,22 @@ class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
                 result = await mod.reauthenticate()
 
             self.assertIn("Successfully authenticated", result)
-            self.assertIn("Previous session deleted", result)
-            self.assertTrue(os.path.exists(token_path))
+            self.assertIn("Previous token replaced", result)
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"token": "new"})
 
     async def test_returns_error_when_no_secrets_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
             mod = _load_module()
-            with patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
                 result = await mod.reauthenticate()
-        self.assertIn("Error", result)
+            self.assertIn("Error", result)
+            # Without a way to log in again, the old token must survive.
+            with open(token_path) as f:
+                self.assertEqual(f.read(), '{"old": "token"}')
 
 
 # ---------------------------------------------------------------------------
@@ -947,10 +954,14 @@ class TestSiteVerificationScope(unittest.TestCase):
         good_creds.valid = True
         good_creds.has_scopes.return_value = True
 
-        with patch("gsc_server.Credentials.from_authorized_user_file", return_value=good_creds), \
-             patch.object(mod, "TOKEN_FILE", "/dev/null"), \
-             patch("gsc_server.os.path.exists", return_value=True):
-            creds = mod.get_oauth_credentials()
+        # A real (temporary) token path: the token lock lives next to the
+        # token file, so a path like /dev/null cannot host it.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write("{}")
+            with patch("gsc_server.Credentials.from_authorized_user_file", return_value=good_creds), \
+                 patch.object(mod, "TOKEN_FILE", token_path):
+                creds = mod.get_oauth_credentials()
 
         self.assertIs(creds, good_creds)
 
@@ -1062,6 +1073,687 @@ class TestVerificationErrorHandling(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Token not found", result)
         self.assertIn("resolve", result)
+
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP transport and the read-only tool set
+#
+# The shared HTTP service serves many sessions at once, so it only exposes
+# tools that cannot change anything in Search Console or on disk. stdio keeps
+# the full set (still behind GSC_ALLOW_DESTRUCTIVE).
+# ---------------------------------------------------------------------------
+
+ALL_TOOL_NAMES = {
+    "list_properties", "add_site", "delete_site", "get_verification_token", "verify_site",
+    "get_search_analytics", "get_site_details", "get_sitemaps", "inspect_url_enhanced",
+    "batch_url_inspection", "check_indexing_issues", "get_performance_overview",
+    "get_advanced_search_analytics", "compare_search_periods", "get_search_by_page_query",
+    "list_sitemaps_enhanced", "get_sitemap_details", "submit_sitemap", "delete_sitemap",
+    "manage_sitemaps", "get_creator_info", "reauthenticate",
+}
+
+WRITE_OR_ADMIN_TOOL_NAMES = {
+    "add_site", "delete_site", "get_verification_token", "verify_site",
+    "submit_sitemap", "delete_sitemap", "manage_sitemaps", "reauthenticate",
+}
+
+
+def _run_main(mod, env):
+    """Run main() with the given env, without starting a real server."""
+    with patch.dict(os.environ, env, clear=False), \
+         patch.object(mod.mcp, "run") as run:
+        mod.main()
+    return run
+
+
+class TestTransport(unittest.IsolatedAsyncioTestCase):
+
+    async def test_stdio_is_default_and_keeps_all_tools(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("MCP_TRANSPORT", None)
+        with patch.dict(os.environ, env, clear=True), patch.object(mod.mcp, "run") as run:
+            mod.main()
+        run.assert_called_once_with(transport="stdio")
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, ALL_TOOL_NAMES)
+
+    async def test_streamable_http_configures_settings_and_runs(self):
+        mod = _load_module()
+        run = _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "18897"})
+        run.assert_called_once_with("streamable-http")
+        settings = mod.mcp.settings
+        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.port, 18897)
+        self.assertTrue(settings.stateless_http)
+        sec = settings.transport_security
+        self.assertTrue(sec.enable_dns_rebinding_protection)
+        self.assertEqual(sorted(sec.allowed_hosts), ["127.0.0.1:18897", "localhost:18897"])
+        self.assertEqual(sec.allowed_origins, [])
+
+    async def test_streamable_http_respects_mcp_host(self):
+        mod = _load_module()
+        _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "18897",
+                        "MCP_HOST": "localhost"})
+        self.assertEqual(mod.mcp.settings.host, "localhost")
+
+    async def test_sse_is_rejected_with_clear_error(self):
+        mod = _load_module()
+        with self.assertRaises(ValueError) as ctx:
+            _run_main(mod, {"MCP_TRANSPORT": "sse"})
+        self.assertIn("streamable-http", str(ctx.exception))
+
+    async def test_unknown_transport_is_rejected(self):
+        mod = _load_module()
+        with self.assertRaises(ValueError) as ctx:
+            _run_main(mod, {"MCP_TRANSPORT": "carrier-pigeon"})
+        self.assertIn("carrier-pigeon", str(ctx.exception))
+
+    async def test_invalid_port_is_rejected(self):
+        mod = _load_module()
+        with self.assertRaises(ValueError):
+            _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "abc"})
+
+
+class TestReadOnlyHttpMode(unittest.IsolatedAsyncioTestCase):
+
+    async def test_every_registered_tool_is_classified(self):
+        """A new tool must be put on one side explicitly, never default into HTTP."""
+        mod = _load_module()
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, ALL_TOOL_NAMES)
+        self.assertEqual(set(mod.READ_ONLY_TOOLS), ALL_TOOL_NAMES - WRITE_OR_ADMIN_TOOL_NAMES)
+        self.assertTrue(set(mod.READ_ONLY_TOOLS) <= names)
+
+    async def test_http_mode_lists_no_write_tool(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "18897",
+                        "GSC_ALLOW_DESTRUCTIVE": "true"})
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, set(mod.READ_ONLY_TOOLS))
+        self.assertFalse(names & WRITE_OR_ADMIN_TOOL_NAMES)
+
+    async def test_http_mode_write_call_touches_no_file_and_no_google_api(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write('{"keep": "me"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(secrets_path, "w") as f:
+                f.write("{}")
+
+            mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true", "GSC_CONFIG_DIR": tmpdir})
+            _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "18897",
+                            "GSC_ALLOW_DESTRUCTIVE": "true"})
+            before = sorted(os.listdir(tmpdir))
+
+            calls = {
+                "reauthenticate": {},
+                "submit_sitemap": {"site_url": "https://example.com/",
+                                   "sitemap_url": "https://example.com/sitemap.xml"},
+                "delete_sitemap": {"site_url": "https://example.com/",
+                                   "sitemap_url": "https://example.com/sitemap.xml"},
+                "manage_sitemaps": {"site_url": "https://example.com/", "action": "submit",
+                                    "sitemap_url": "https://example.com/sitemap.xml"},
+                "add_site": {"site_url": "https://example.com/"},
+                "delete_site": {"site_url": "https://example.com/"},
+                "verify_site": {"site_url": "sc-domain:example.com"},
+                "get_verification_token": {"site_url": "sc-domain:example.com"},
+            }
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.build") as build, \
+                 patch("gsc_server.InstalledAppFlow") as flow, \
+                 patch("gsc_server.Credentials.from_authorized_user_file") as load, \
+                 patch("sys.stdin.isatty", return_value=True):
+                for name, args in calls.items():
+                    with self.assertRaises(ToolError, msg=name):
+                        await mod.mcp.call_tool(name, args)
+
+            build.assert_not_called()
+            flow.from_client_secrets_file.assert_not_called()
+            load.assert_not_called()
+            self.assertEqual(sorted(os.listdir(tmpdir)), before)
+            with open(token_path) as f:
+                self.assertEqual(f.read(), '{"keep": "me"}')
+
+    async def test_http_mode_read_tool_still_works(self):
+        mod = _load_module()
+        _run_main(mod, {"MCP_TRANSPORT": "streamable-http", "MCP_PORT": "18897"})
+        service = _make_service()
+        service.sites().list().execute.return_value = {
+            "siteEntry": [{"siteUrl": "sc-domain:example.com", "permissionLevel": "siteOwner"}]
+        }
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.mcp.call_tool("list_properties", {})
+        self.assertIn("sc-domain:example.com", json.dumps(result, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Token file: never deleted, written atomically, guarded by a file lock
+# ---------------------------------------------------------------------------
+
+def _future(hours=1):
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_real_token(path, expiry, token="at"):
+    with open(path, "w") as f:
+        json.dump({
+            "token": token,
+            "refresh_token": "rt",
+            "client_id": "cid",
+            "client_secret": "secret",
+            "scopes": [
+                "https://www.googleapis.com/auth/webmasters",
+                "https://www.googleapis.com/auth/siteverification",
+            ],
+            "expiry": expiry,
+        }, f)
+
+
+def _load_oauth_module(tmpdir):
+    return _load_module({"GSC_SKIP_OAUTH": "false", "GSC_CONFIG_DIR": tmpdir})
+
+
+def _fake_refresh(delay=0.0):
+    """Stand-in for google.oauth2.credentials.Credentials.refresh (a network call)."""
+    import time as _time
+    from google.auth import _helpers
+
+    def refresh(self, request):
+        _time.sleep(delay)
+        self.token = "refreshed"
+        self.expiry = _helpers.utcnow() + timedelta(hours=1)
+    return refresh
+
+
+class TestTokenFileSafety(unittest.TestCase):
+
+    def test_corrupt_token_file_is_kept_and_call_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write("not json{")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                with self.assertRaises(RuntimeError) as ctx:
+                    mod.get_oauth_credentials()
+            self.assertIn(token_path, str(ctx.exception))
+            with open(token_path) as f:
+                self.assertEqual(f.read(), "not json{")
+
+    def test_failed_refresh_keeps_token_file_and_call_fails(self):
+        from google.auth.exceptions import RefreshError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            _write_real_token(token_path, _future(-1))
+            with open(token_path) as f:
+                original = f.read()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("sys.stdin.isatty", return_value=False), \
+                 patch("gsc_server.Credentials.refresh", side_effect=RefreshError("invalid_grant")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    mod.get_oauth_credentials()
+            self.assertIn("invalid_grant", str(ctx.exception))
+            with open(token_path) as f:
+                self.assertEqual(f.read(), original)
+
+    def test_refreshed_token_is_written_atomically_with_mode_0600(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            _write_real_token(token_path, _future(-1))
+            os.chmod(token_path, 0o644)
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.Credentials.refresh", _fake_refresh()), \
+                 patch("gsc_server.os.replace", wraps=os.replace) as replace:
+                creds = mod.get_oauth_credentials()
+            self.assertEqual(creds.token, "refreshed")
+            replace.assert_called_once()
+            src, dst = replace.call_args.args
+            self.assertEqual(dst, token_path)
+            self.assertEqual(os.path.dirname(src), tmpdir)
+            self.assertEqual(os.stat(token_path).st_mode & 0o777, 0o600)
+            with open(token_path) as f:
+                self.assertEqual(json.load(f)["token"], "refreshed")
+            # No temp files left behind; only the token and its lock file.
+            self.assertEqual(sorted(os.listdir(tmpdir)), ["token.json", "token.json.lock"])
+
+    def test_concurrent_refreshes_end_with_one_valid_file(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            _write_real_token(token_path, _future(-1))
+            results, errors = [], []
+            refresh = MagicMock(side_effect=_fake_refresh(0.2))
+
+            def call():
+                try:
+                    results.append(mod.get_oauth_credentials())
+                except Exception as e:  # pragma: no cover - surfaced below
+                    errors.append(e)
+
+            def refresh_method(self, request):
+                return refresh(self, request)
+
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.Credentials.refresh", refresh_method):
+                threads = [threading.Thread(target=call) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(c.valid for c in results))
+            # The second caller re-reads inside the lock and finds the fresh token.
+            self.assertEqual(refresh.call_count, 1)
+            with open(token_path) as f:
+                data = json.load(f)
+            self.assertEqual(data["token"], "refreshed")
+            self.assertEqual(os.stat(token_path).st_mode & 0o777, 0o600)
+
+    def test_reauthenticate_without_tty_keeps_token(self):
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(secrets_path, "w") as f:
+                f.write("{}")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                asyncio.run(mod.reauthenticate())
+            with open(token_path) as f:
+                self.assertEqual(f.read(), '{"old": "token"}')
+
+    def test_reauthenticate_failed_login_keeps_token(self):
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(secrets_path, "w") as f:
+                f.write("{}")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True):
+                flow_cls.from_client_secrets_file.return_value.run_local_server.side_effect = (
+                    RuntimeError("browser closed")
+                )
+                result = asyncio.run(mod.reauthenticate())
+            self.assertIn("Error", result)
+            with open(token_path) as f:
+                self.assertEqual(f.read(), '{"old": "token"}')
+
+
+# ---------------------------------------------------------------------------
+# Event loop: the whole synchronous chain of a tool runs in a worker thread
+# ---------------------------------------------------------------------------
+
+class TestEventLoopNotBlocked(unittest.IsolatedAsyncioTestCase):
+
+    DELAY = 0.5
+
+    async def _heartbeat(self, stop, ticks):
+        import asyncio
+        while not stop.is_set():
+            ticks.append(1)
+            await asyncio.sleep(0.02)
+
+    async def _run_two_with_heartbeat(self, make_call):
+        import asyncio
+        import time as _time
+
+        stop, ticks = asyncio.Event(), []
+        beat = asyncio.create_task(self._heartbeat(stop, ticks))
+        start = _time.perf_counter()
+        results = await asyncio.gather(make_call(), make_call())
+        elapsed = _time.perf_counter() - start
+        stop.set()
+        await beat
+        return results, elapsed, len(ticks)
+
+    async def test_slow_google_call_does_not_block(self):
+        import time as _time
+
+        mod = _load_module()
+        service = _make_service()
+
+        def slow_execute():
+            _time.sleep(self.DELAY)
+            return {"siteEntry": [{"siteUrl": "sc-domain:example.com", "permissionLevel": "siteOwner"}]}
+
+        service.sites().list().execute.side_effect = slow_execute
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            results, elapsed, ticks = await self._run_two_with_heartbeat(
+                lambda: mod.mcp.call_tool("list_properties", {})
+            )
+        self.assertEqual(len(results), 2)
+        self.assertLess(elapsed, self.DELAY * 1.6, "two calls ran one after the other")
+        # ~25 ticks fit in 0.5 s at 20 ms; a blocked loop manages about one.
+        self.assertGreater(ticks, 10)
+
+    async def test_slow_credential_refresh_does_not_block(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = _load_oauth_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            _write_real_token(token_path, _future(-1))
+            service = _make_service()
+            service.sites().list().execute.return_value = {
+                "siteEntry": [{"siteUrl": "sc-domain:example.com", "permissionLevel": "siteOwner"}]
+            }
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.Credentials.refresh", _fake_refresh(self.DELAY)), \
+                 patch("gsc_server.build", return_value=service):
+                results, elapsed, ticks = await self._run_two_with_heartbeat(
+                    lambda: mod.mcp.call_tool("list_properties", {})
+                )
+        self.assertEqual(len(results), 2)
+        self.assertIn("sc-domain:example.com", json.dumps(results, default=str))
+        # The second call waits for the lock and then reuses the fresh token.
+        self.assertLess(elapsed, self.DELAY * 1.6)
+        self.assertGreater(ticks, 10)
+
+
+class TestTokenLockWithoutFcntl(unittest.TestCase):
+    """Windows has no fcntl: the lock falls back to msvcrt and fchmod is skipped."""
+
+    def test_msvcrt_fallback_locks_and_unlocks(self):
+        import gsc_server as mod
+        calls = []
+        fake = MagicMock()
+        fake.LK_LOCK, fake.LK_UNLCK = 1, 0
+        fake.locking.side_effect = lambda fd, mode, n: calls.append(mode)
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(mod, "TOKEN_FILE", os.path.join(tmpdir, "token.json")), \
+             patch.object(mod, "fcntl", None), \
+             patch.object(mod, "msvcrt", fake):
+            with mod._token_lock():
+                self.assertEqual(calls, [fake.LK_LOCK])
+            self.assertEqual(calls, [fake.LK_LOCK, fake.LK_UNLCK])
+
+    def test_write_without_fchmod(self):
+        import gsc_server as mod
+        creds = MagicMock()
+        creds.to_json.return_value = '{"token": "x"}'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "token.json")
+            had_fchmod = hasattr(mod.os, "fchmod")
+            saved = getattr(mod.os, "fchmod", None)
+            try:
+                if had_fchmod:
+                    del mod.os.fchmod
+                with patch.object(mod, "TOKEN_FILE", path):
+                    mod._write_token_atomic(creds)
+            finally:
+                if had_fchmod:
+                    mod.os.fchmod = saved
+            with open(path) as f:
+                self.assertEqual(f.read(), '{"token": "x"}')
+
+
+# ---------------------------------------------------------------------------
+# Every HTTP entry point is read-only, /health checks the Host, and HTTP mode
+# never starts an interactive OAuth flow
+# ---------------------------------------------------------------------------
+
+class TestHttpEntryPointsWithoutMain(unittest.IsolatedAsyncioTestCase):
+    """streamable_http_app() and sse_app() must be safe even when main() never ran."""
+
+    async def test_streamable_http_app_without_main_lists_only_read_only_tools(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        mod.mcp.streamable_http_app()
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, set(mod.READ_ONLY_TOOLS))
+
+    async def test_sse_app_without_main_lists_only_read_only_tools(self):
+        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
+        mod.mcp.sse_app()
+        names = {t.name for t in await mod.mcp.list_tools()}
+        self.assertEqual(names, set(mod.READ_ONLY_TOOLS))
+
+    async def test_streamable_http_app_without_main_sets_exact_host_check(self):
+        mod = _load_module()
+        mod.mcp.settings.port = 18899
+        mod.mcp.streamable_http_app()
+        sec = mod.mcp.settings.transport_security
+        self.assertTrue(sec.enable_dns_rebinding_protection)
+        self.assertEqual(sorted(sec.allowed_hosts), ["127.0.0.1:18899", "localhost:18899"])
+        self.assertEqual(sec.allowed_origins, [])
+
+    async def test_http_entry_point_turns_interactive_auth_off(self):
+        mod = _load_module()
+        self.assertTrue(mod._INTERACTIVE_AUTH)
+        mod.mcp.streamable_http_app()
+        self.assertFalse(mod._INTERACTIVE_AUTH)
+
+    async def test_stdio_keeps_interactive_auth(self):
+        mod = _load_module()
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("MCP_TRANSPORT", None)
+        with patch.dict(os.environ, env, clear=True), patch.object(mod.mcp, "run"):
+            mod.main()
+        self.assertTrue(mod._INTERACTIVE_AUTH)
+
+
+class TestHealthRoute(unittest.TestCase):
+
+    def _client(self, port=18897):
+        from starlette.testclient import TestClient
+        mod = _load_module()
+        mod.configure_streamable_http(mod.mcp, "127.0.0.1", port)
+        return TestClient(mod.mcp.streamable_http_app())
+
+    def test_health_with_allowed_hosts_is_200(self):
+        client = self._client()
+        for host in ("127.0.0.1:18897", "localhost:18897"):
+            r = client.get("/health", headers={"Host": host})
+            self.assertEqual(r.status_code, 200, host)
+
+    def test_health_with_foreign_host_is_421(self):
+        client = self._client()
+        for host in ("evil.example", "evil.example:18897", "127.0.0.1:9999",
+                     "127.0.0.1", "localhost"):
+            r = client.get("/health", headers={"Host": host})
+            self.assertEqual(r.status_code, 421, host)
+
+
+class TestHttpModeNeverInteractiveOAuth(unittest.TestCase):
+
+    def _http_module(self, tmpdir):
+        mod = _load_oauth_module(tmpdir)
+        mod.configure_streamable_http(mod.mcp, "127.0.0.1", 18897)
+        return mod
+
+    def test_missing_token_with_tty_raises_and_starts_no_flow(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._http_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(secrets_path, "w") as f:
+                f.write("{}")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow, \
+                 patch("sys.stdin.isatty", return_value=True):
+                with self.assertRaises(mod.TokenError) as ctx:
+                    mod.get_oauth_credentials()
+            flow.from_client_secrets_file.assert_not_called()
+            self.assertFalse(os.path.exists(token_path))
+            msg = str(ctx.exception)
+            self.assertIn(token_path, msg)
+            self.assertIn("interactive terminal", msg)
+            self.assertIn("GSC_CONFIG_DIR", msg)
+            self.assertIn("--auth", msg)
+
+    def test_unusable_token_with_tty_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod = self._http_module(tmpdir)
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as f:
+                f.write("not json{")
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow, \
+                 patch("sys.stdin.isatty", return_value=True):
+                with self.assertRaises(mod.TokenError):
+                    mod.get_oauth_credentials()
+            flow.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(f.read(), "not json{")
+
+
+class TestAuthEntry(unittest.TestCase):
+    """`python gsc_server.py --auth` renews the token from a terminal and exits."""
+
+    def test_auth_flag_runs_login_writes_token_and_does_not_serve(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            new_creds = MagicMock()
+            new_creds.to_json.return_value = '{"token": "new"}'
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO) as out:
+                flow_cls.from_client_secrets_file.return_value.run_local_server.return_value = new_creds
+                mod.main(["--auth"])
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_called_once()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"token": "new"})
+            self.assertIn(token_path, out.getvalue())
+
+    def test_auth_flag_without_secrets_file_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "ontbreekt.json")), \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod.mcp, "run") as run:
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth"])
+            self.assertEqual(ctx.exception.code, 1)
+            run.assert_not_called()
+
+    def test_auth_flag_without_terminal_fails_and_keeps_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write("{corrupt")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=False), \
+                 patch.object(mod.mcp, "run") as run:
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth"])
+            self.assertNotEqual(ctx.exception.code, 0)
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(f.read(), "{corrupt")
+
+
+class TestAuthEntryForceAndTexts(unittest.TestCase):
+
+    def test_force_replaces_valid_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            new_creds = MagicMock()
+            new_creds.to_json.return_value = '{"token": "new"}'
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod, "get_oauth_credentials", return_value=MagicMock()), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                # The stored token counts as valid: only --force may start a new login.
+                flow_cls.from_client_secrets_file.return_value.run_local_server.return_value = new_creds
+                mod.main(["--auth", "--force"])
+            run.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"token": "new"})
+
+    def test_force_without_terminal_exits_1_and_keeps_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=False), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth", "--force"])
+            self.assertEqual(ctx.exception.code, 1)
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"old": "token"})
+
+    def test_console_entrypoint_reads_sys_argv(self):
+        mod = _load_module()
+        with patch.object(sys, "argv", ["mcp-gsc", "--auth"]), \
+             patch.object(mod, "get_oauth_credentials") as goc, \
+             patch.object(mod.mcp, "run") as run, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mod.main()
+        goc.assert_called_once()
+        run.assert_not_called()
+
+    def test_stdio_without_tty_text_names_auth_with_this_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                with self.assertRaises(mod.TokenError) as ctx:
+                    mod.get_oauth_credentials()
+            msg = str(ctx.exception)
+            self.assertIn("--auth", msg)
+            self.assertIn(sys.executable, msg)
+
+    def test_reauthenticate_without_tty_names_force(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            with patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                msg = mod.reauthenticate.__wrapped__()
+            self.assertIn("--auth --force", msg)
+            self.assertIn(sys.executable, msg)
 
 
 if __name__ == "__main__":
