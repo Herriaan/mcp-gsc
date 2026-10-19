@@ -1701,6 +1701,27 @@ class TestAuthEntryForceAndTexts(unittest.TestCase):
             with open(token_path) as f:
                 self.assertEqual(json.load(f), {"token": "new"})
 
+    def test_force_without_terminal_exits_1_and_keeps_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=False), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth", "--force"])
+            self.assertEqual(ctx.exception.code, 1)
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"old": "token"})
+
     def test_console_entrypoint_reads_sys_argv(self):
         mod = _load_module()
         with patch.object(sys, "argv", ["mcp-gsc", "--auth"]), \

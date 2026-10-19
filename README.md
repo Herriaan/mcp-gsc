@@ -577,7 +577,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **Token never deleted:** an unreadable `token.json`, a failed refresh or `reauthenticate` used to delete the token file, which took the server down for every client. The file now stays; the call fails with a clear error, and `reauthenticate` replaces the token only after a successful new login. Token writes are atomic (temp file, mode `0600`, `os.replace`) under an `fcntl` lock on `token.json.lock`. (@herriaan)
 
 #### Tests
-- 36 new tests (90 in total): transport settings, read-only tool list and blocked write calls over HTTP, token safety (corrupt file, failed refresh, concurrent refresh, atomic `0600` write, reauthenticate keeps the token), and event-loop concurrency with a slow Google call and a slow token refresh. (@herriaan)
+- 37 new tests (91 in total): transport settings, read-only tool list and blocked write calls over HTTP, token safety (corrupt file, failed refresh, concurrent refresh, atomic `0600` write, reauthenticate keeps the token), and event-loop concurrency with a slow Google call and a slow token refresh. (@herriaan)
 
 ### [0.3.1] — August 2026
 
