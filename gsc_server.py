@@ -391,8 +391,8 @@ def get_oauth_credentials(required_scopes=None):
             f"Token file: {TOKEN_FILE}\n"
             "This shared HTTP service never starts a login itself. Renew the token "
             "in an interactive terminal (a TTY, so not through an MCP client): run "
-            "gsc_server.py from a checkout that has client_secrets.json, with "
-            "GSC_CONFIG_DIR set to the directory of the file above. It writes the "
+            "`python gsc_server.py --auth` from a checkout that has client_secrets.json, "
+            "with GSC_CONFIG_DIR set to the directory of the file above. It writes the "
             "new token there; the service picks it up on the next call."
         )
     if not sys.stdin.isatty():
@@ -2035,8 +2035,24 @@ def configure_streamable_http(server, host: str, port: int):
     _restrict_to_read_only(server)
 
 
-def main():
-    """Entry point for the MCP server. Supports stdio (default) and streamable-http."""
+def main(argv=None):
+    """Entry point for the MCP server. Supports stdio (default) and streamable-http.
+
+    `--auth` does not serve: it renews the OAuth token from an interactive
+    terminal (a browser login when the stored token is unusable), prints the
+    token path and exits. This is the recovery route for the shared HTTP
+    service, which never starts a login itself.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if "--auth" in argv:
+        try:
+            get_oauth_credentials()
+        except TokenError as e:
+            print(f"Token renewal failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Token ok: {TOKEN_FILE}")
+        return
+
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower().strip()
 
     if transport == "stdio":

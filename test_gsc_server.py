@@ -1619,5 +1619,48 @@ class TestHttpModeNeverInteractiveOAuth(unittest.TestCase):
                 self.assertEqual(f.read(), "not json{")
 
 
+class TestAuthEntry(unittest.TestCase):
+    """`python gsc_server.py --auth` renews the token from a terminal and exits."""
+
+    def test_auth_flag_runs_login_writes_token_and_does_not_serve(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            new_creds = MagicMock()
+            new_creds.to_json.return_value = '{"token": "new"}'
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO) as out:
+                flow_cls.from_client_secrets_file.return_value.run_local_server.return_value = new_creds
+                mod.main(["--auth"])
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_called_once()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"token": "new"})
+            self.assertIn(token_path, out.getvalue())
+
+    def test_auth_flag_without_terminal_fails_and_keeps_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write("{corrupt")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=False), \
+                 patch.object(mod.mcp, "run") as run:
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth"])
+            self.assertNotEqual(ctx.exception.code, 0)
+            run.assert_not_called()
+            flow_cls.from_client_secrets_file.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(f.read(), "{corrupt")
+
+
 if __name__ == "__main__":
     unittest.main()
