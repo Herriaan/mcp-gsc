@@ -1602,6 +1602,7 @@ class TestHttpModeNeverInteractiveOAuth(unittest.TestCase):
             self.assertIn(token_path, msg)
             self.assertIn("interactive terminal", msg)
             self.assertIn("GSC_CONFIG_DIR", msg)
+            self.assertIn("--auth", msg)
 
     def test_unusable_token_with_tty_is_left_untouched(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1673,6 +1674,65 @@ class TestAuthEntry(unittest.TestCase):
             flow_cls.from_client_secrets_file.assert_not_called()
             with open(token_path) as f:
                 self.assertEqual(f.read(), "{corrupt")
+
+
+class TestAuthEntryForceAndTexts(unittest.TestCase):
+
+    def test_force_replaces_valid_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            open(token_path, "w").write('{"old": "token"}')
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            new_creds = MagicMock()
+            new_creds.to_json.return_value = '{"token": "new"}'
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("gsc_server.InstalledAppFlow") as flow_cls, \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod, "get_oauth_credentials", return_value=MagicMock()), \
+                 patch.object(mod.mcp, "run") as run, \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                # The stored token counts as valid: only --force may start a new login.
+                flow_cls.from_client_secrets_file.return_value.run_local_server.return_value = new_creds
+                mod.main(["--auth", "--force"])
+            run.assert_not_called()
+            with open(token_path) as f:
+                self.assertEqual(json.load(f), {"token": "new"})
+
+    def test_console_entrypoint_reads_sys_argv(self):
+        mod = _load_module()
+        with patch.object(sys, "argv", ["mcp-gsc", "--auth"]), \
+             patch.object(mod, "get_oauth_credentials") as goc, \
+             patch.object(mod.mcp, "run") as run, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mod.main()
+        goc.assert_called_once()
+        run.assert_not_called()
+
+    def test_stdio_without_tty_text_names_auth_with_this_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                with self.assertRaises(mod.TokenError) as ctx:
+                    mod.get_oauth_credentials()
+            msg = str(ctx.exception)
+            self.assertIn("--auth", msg)
+            self.assertIn(sys.executable, msg)
+
+    def test_reauthenticate_without_tty_names_force(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            open(secrets_path, "w").write("{}")
+            mod = _load_module()
+            with patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch("sys.stdin.isatty", return_value=False):
+                msg = mod.reauthenticate.__wrapped__()
+            self.assertIn("--auth --force", msg)
+            self.assertIn(sys.executable, msg)
 
 
 if __name__ == "__main__":

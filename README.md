@@ -562,7 +562,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 #### Added
 - **streamable-http transport:** `MCP_TRANSPORT=streamable-http` runs the server as one shared, stateless HTTP service (`/mcp`) with an explicit Host and Origin check (`127.0.0.1:<port>`/`localhost:<port>`, no Origin allowed). (@herriaan)
 - **`/health` with its own Host check** (`421` for a foreign Host, like `/mcp`). (@herriaan)
-- **`python gsc_server.py --auth`:** renews the OAuth token from an interactive terminal (login only when the stored token is unusable), prints the token path and exits without serving; the recovery route for the shared HTTP service. (@herriaan)
+- **`python gsc_server.py --auth`:** renews the OAuth token from an interactive terminal (login only when the stored token is unusable), prints the token path and exits without serving; the recovery route for the shared HTTP service. `--auth --force` always runs a new login, also over a valid token (switching accounts). Recovery messages name this exact command with the running interpreter. (@herriaan)
 - **HTTP safety outside `main()`:** `streamable_http_app()` and `sse_app()` apply the read-only tool set, the exact Host check and the no-interactive-login rule themselves. (@herriaan)
 - **Read-only tool set over HTTP:** in streamable-http mode only the 14 tools on `READ_ONLY_TOOLS` are registered; add/delete/verify, sitemap submit/delete, `manage_sitemaps` and `reauthenticate` stay stdio-only. (@herriaan)
 
@@ -577,7 +577,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **Token never deleted:** an unreadable `token.json`, a failed refresh or `reauthenticate` used to delete the token file, which took the server down for every client. The file now stays; the call fails with a clear error, and `reauthenticate` replaces the token only after a successful new login. Token writes are atomic (temp file, mode `0600`, `os.replace`) under an `fcntl` lock on `token.json.lock`. (@herriaan)
 
 #### Tests
-- 32 new tests (86 in total): transport settings, read-only tool list and blocked write calls over HTTP, token safety (corrupt file, failed refresh, concurrent refresh, atomic `0600` write, reauthenticate keeps the token), and event-loop concurrency with a slow Google call and a slow token refresh. (@herriaan)
+- 36 new tests (90 in total): transport settings, read-only tool list and blocked write calls over HTTP, token safety (corrupt file, failed refresh, concurrent refresh, atomic `0600` write, reauthenticate keeps the token), and event-loop concurrency with a slow Google call and a slow token refresh. (@herriaan)
 
 ### [0.3.1] — August 2026
 

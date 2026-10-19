@@ -399,7 +399,7 @@ def get_oauth_credentials(required_scopes=None):
         raise TokenError(
             f"OAuth token cannot be used: {reason}.\n"
             "Run the OAuth flow manually first:\n"
-            f"  cd {SCRIPT_DIR} && python gsc_server.py --auth\n"
+            f"  cd {SCRIPT_DIR} && {sys.executable} gsc_server.py --auth\n"
             "Then restart Claude Code."
         )
 
@@ -1984,7 +1984,7 @@ def reauthenticate() -> str:
             return (
                 "Cannot open browser for re-authentication from MCP. "
                 "The current token was left unchanged. Run manually:\n"
-                f"  cd {SCRIPT_DIR} && .venv/bin/python gsc_server.py --auth\n"
+                f"  cd {SCRIPT_DIR} && {sys.executable} gsc_server.py --auth --force\n"
                 "Then restart Claude Code."
             )
 
@@ -2045,6 +2045,13 @@ def main(argv=None):
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--auth" in argv:
+        if "--force" in argv:
+            # Always a new login, also over a valid token (switching accounts).
+            result = reauthenticate.__wrapped__()
+            print(result)
+            if not result.startswith(("Successfully", "Previous token replaced")):
+                sys.exit(1)
+            return
         try:
             get_oauth_credentials()
         except (TokenError, FileNotFoundError) as e:
