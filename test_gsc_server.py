@@ -1501,10 +1501,15 @@ class TestTokenLockWithoutFcntl(unittest.TestCase):
         creds.to_json.return_value = '{"token": "x"}'
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "token.json")
-            with patch.object(mod, "TOKEN_FILE", path), \
-                 patch.object(mod.os, "fchmod", create=True) as fchmod:
-                del mod.os.fchmod
-                mod._write_token_atomic(creds)
-            fchmod.assert_not_called()
+            had_fchmod = hasattr(mod.os, "fchmod")
+            saved = getattr(mod.os, "fchmod", None)
+            try:
+                if had_fchmod:
+                    del mod.os.fchmod
+                with patch.object(mod, "TOKEN_FILE", path):
+                    mod._write_token_atomic(creds)
+            finally:
+                if had_fchmod:
+                    mod.os.fchmod = saved
             with open(path) as f:
                 self.assertEqual(f.read(), '{"token": "x"}')
