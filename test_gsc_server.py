@@ -1476,3 +1476,35 @@ class TestEventLoopNotBlocked(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTokenLockWithoutFcntl(unittest.TestCase):
+    """Windows has no fcntl: the lock falls back to msvcrt and fchmod is skipped."""
+
+    def test_msvcrt_fallback_locks_and_unlocks(self):
+        import gsc_server as mod
+        calls = []
+        fake = MagicMock()
+        fake.LK_LOCK, fake.LK_UNLCK = 1, 0
+        fake.locking.side_effect = lambda fd, mode, n: calls.append(mode)
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(mod, "TOKEN_FILE", os.path.join(tmpdir, "token.json")), \
+             patch.object(mod, "fcntl", None), \
+             patch.object(mod, "msvcrt", fake):
+            with mod._token_lock():
+                self.assertEqual(calls, [fake.LK_LOCK])
+            self.assertEqual(calls, [fake.LK_LOCK, fake.LK_UNLCK])
+
+    def test_write_without_fchmod(self):
+        import gsc_server as mod
+        creds = MagicMock()
+        creds.to_json.return_value = '{"token": "x"}'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "token.json")
+            with patch.object(mod, "TOKEN_FILE", path), \
+                 patch.object(mod.os, "fchmod", create=True) as fchmod:
+                del mod.os.fchmod
+                mod._write_token_atomic(creds)
+            fchmod.assert_not_called()
+            with open(path) as f:
+                self.assertEqual(f.read(), '{"token": "x"}')

@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Optional
 import asyncio
 import contextlib
-import fcntl
 import functools
 import logging
 import os
@@ -9,6 +8,13 @@ import json
 import sys
 import shutil
 import tempfile
+
+try:  # POSIX
+    import fcntl
+    msvcrt = None
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 from datetime import datetime, timedelta
 from platformdirs import user_config_dir
 
@@ -196,11 +202,24 @@ def _token_lock():
     """
     fd = os.open(_token_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            # Windows: LK_LOCK gives up after ~10 s, so keep retrying.
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            else:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     finally:
         os.close(fd)
 
@@ -214,7 +233,8 @@ def _write_token_atomic(creds):
     directory = os.path.dirname(TOKEN_FILE) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".token.", suffix=".tmp")
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):  # not on Windows; mkstemp is already 0600 on POSIX
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as tmp:
             tmp.write(creds.to_json())
             tmp.flush()
