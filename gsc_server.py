@@ -399,7 +399,7 @@ def get_oauth_credentials(required_scopes=None):
         raise TokenError(
             f"OAuth token cannot be used: {reason}.\n"
             "Run the OAuth flow manually first:\n"
-            f"  cd {SCRIPT_DIR} && python gsc_server.py\n"
+            f"  cd {SCRIPT_DIR} && python gsc_server.py --auth\n"
             "Then restart Claude Code."
         )
 
@@ -1984,7 +1984,7 @@ def reauthenticate() -> str:
             return (
                 "Cannot open browser for re-authentication from MCP. "
                 "The current token was left unchanged. Run manually:\n"
-                f"  cd {SCRIPT_DIR} && .venv/bin/python gsc_server.py\n"
+                f"  cd {SCRIPT_DIR} && .venv/bin/python gsc_server.py --auth\n"
                 "Then restart Claude Code."
             )
 
@@ -2047,7 +2047,7 @@ def main(argv=None):
     if "--auth" in argv:
         try:
             get_oauth_credentials()
-        except TokenError as e:
+        except (TokenError, FileNotFoundError) as e:
             print(f"Token renewal failed: {e}", file=sys.stderr)
             sys.exit(1)
         print(f"Token ok: {TOKEN_FILE}")

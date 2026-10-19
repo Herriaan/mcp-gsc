@@ -1644,6 +1644,19 @@ class TestAuthEntry(unittest.TestCase):
                 self.assertEqual(json.load(f), {"token": "new"})
             self.assertIn(token_path, out.getvalue())
 
+    def test_auth_flag_without_secrets_file_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "ontbreekt.json")), \
+                 patch("sys.stdin.isatty", return_value=True), \
+                 patch.object(mod.mcp, "run") as run:
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["--auth"])
+            self.assertEqual(ctx.exception.code, 1)
+            run.assert_not_called()
+
     def test_auth_flag_without_terminal_fails_and_keeps_token(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             token_path = os.path.join(tmpdir, "token.json")
