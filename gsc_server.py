@@ -1,9 +1,14 @@
 from typing import Any, Dict, List, Optional
+import asyncio
+import contextlib
+import fcntl
+import functools
 import logging
 import os
 import json
 import sys
 import shutil
+import tempfile
 from datetime import datetime, timedelta
 from platformdirs import user_config_dir
 
@@ -22,8 +27,57 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 # MCP
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP("gsc-server")
+
+
+def _run_in_worker(fn):
+    """
+    Turns a synchronous tool body into an async tool that runs in a worker thread.
+
+    Every Google call in this server is blocking: loading and refreshing the
+    OAuth token, building the service, the request itself and any follow-up
+    pages. Run directly on the event loop, one slow call stalls every other
+    request the server is handling, which matters once many sessions share
+    one streamable-http process. The whole chain therefore runs in a single
+    asyncio.to_thread worker. The undecorated function stays reachable as
+    ``tool.__wrapped__`` for tools that call each other.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return wrapper
+
+
+# Tools exposed over streamable-http. That service is shared by many sessions,
+# so it only carries tools that read from Search Console and cannot change
+# anything there or in the token file. Everything else stays stdio-only (and
+# still behind GSC_ALLOW_DESTRUCTIVE where it was before):
+#   add_site, delete_site, verify_site      change properties or ownership
+#   get_verification_token                  part of the verification flow, needs the siteverification scope
+#   submit_sitemap, delete_sitemap          change sitemaps
+#   manage_sitemaps                         mixes read and write actions; its read actions are
+#                                           list_sitemaps_enhanced and get_sitemap_details
+#   reauthenticate                          replaces the OAuth token
+# test_every_registered_tool_is_classified fails when a new tool is added
+# without deciding which side it belongs on.
+READ_ONLY_TOOLS = frozenset({
+    "list_properties",
+    "get_search_analytics",
+    "get_site_details",
+    "get_sitemaps",
+    "inspect_url_enhanced",
+    "batch_url_inspection",
+    "check_indexing_issues",
+    "get_performance_overview",
+    "get_advanced_search_analytics",
+    "compare_search_periods",
+    "get_search_by_page_query",
+    "list_sitemaps_enhanced",
+    "get_sitemap_details",
+    "get_creator_info",
+})
 
 # Path to your service account JSON or user credentials JSON
 # First check if GSC_CREDENTIALS_PATH environment variable is set
@@ -92,6 +146,7 @@ def get_gsc_service():
     Returns an authorized Search Console service object.
     First tries OAuth authentication, then falls back to service account.
     """
+    oauth_error = None
     # Try OAuth authentication first if not skipped
     if not SKIP_OAUTH:
         try:
@@ -99,7 +154,7 @@ def get_gsc_service():
         except Exception as e:
             # If OAuth fails, try service account
             logging.warning("OAuth authentication failed: %s", e)
-            pass
+            oauth_error = e
     
     # Try service account authentication
     for cred_path in POSSIBLE_CREDENTIAL_PATHS:
@@ -113,12 +168,107 @@ def get_gsc_service():
                 continue  # Try the next path if this one fails
     
     # If we get here, none of the authentication methods worked
+    oauth_reason = f"OAuth: {oauth_error}\n" if oauth_error else ""
     raise FileNotFoundError(
-        f"Authentication failed. Please either:\n"
+        f"Authentication failed. {oauth_reason}Please either:\n"
         f"1. Set up OAuth by placing a client_secrets.json file in the script directory, or\n"
         f"2. Set the GSC_CREDENTIALS_PATH environment variable or place a service account credentials file in one of these locations: "
         f"{', '.join([p for p in POSSIBLE_CREDENTIAL_PATHS[1:] if p])}"
     )
+
+class TokenError(RuntimeError):
+    """The stored OAuth token cannot be used. The token file is left as it is."""
+
+
+def _token_lock_path():
+    return TOKEN_FILE + ".lock"
+
+
+@contextlib.contextmanager
+def _token_lock():
+    """
+    Exclusive fcntl lock on a separate lock file next to the token.
+
+    Held around every read-refresh-write of the token, so no reader ever sees
+    a half-written file and two refreshes cannot interleave. Works across
+    threads (each call opens its own file description) and across processes,
+    such as a stdio admin entry running next to the shared HTTP service.
+    """
+    fd = os.open(_token_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _write_token_atomic(creds):
+    """
+    Writes the token through a unique temp file in the same directory
+    (mode 0600) and os.replace, so the token file is always either the old
+    or the new complete token. Call with the token lock held.
+    """
+    directory = os.path.dirname(TOKEN_FILE) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".token.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as tmp:
+            tmp.write(creds.to_json())
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, TOKEN_FILE)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_path)
+        raise
+
+
+def _load_token_locked(required_scopes):
+    """
+    Reads (and if needed refreshes) the stored token. Call with the lock held.
+
+    Returns (creds, None) when usable, or (None, reason) when a new consent is
+    needed. Never deletes the token file: an unreadable token or a failed
+    refresh must not take the service down for every other session, and the
+    file may still be what a human needs to diagnose the problem.
+    """
+    if not os.path.exists(TOKEN_FILE):
+        return None, f"no OAuth token at {TOKEN_FILE}"
+
+    try:
+        # No `scopes` argument: from_authorized_user_info only reads the
+        # scopes recorded in the file when the caller passes None. Passing
+        # SCOPES here would silently overwrite whatever Google actually
+        # granted with the scopes this version of the code wants, which
+        # makes the has_scopes() check below trivially true for every
+        # token file regardless of what was really authorized.
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+    except Exception as e:
+        return None, f"OAuth token file {TOKEN_FILE} is unreadable ({e}); it was left in place"
+
+    # A token missing a scope this specific call needs cannot serve it.
+    if not creds.has_scopes(required_scopes):
+        return None, f"OAuth token at {TOKEN_FILE} lacks a required scope ({', '.join(required_scopes)})"
+
+    if creds.valid:
+        return creds, None
+
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            return None, (
+                f"refreshing the OAuth token at {TOKEN_FILE} failed ({e}); "
+                "the token file was left in place"
+            )
+        _write_token_atomic(creds)
+        return creds, None
+
+    return None, f"OAuth token at {TOKEN_FILE} is expired and has no refresh token"
+
 
 def get_oauth_credentials(required_scopes=None):
     """
@@ -141,75 +291,48 @@ def get_oauth_credentials(required_scopes=None):
     through the same re-consent path below as a missing or expired token —
     and that re-consent always requests the full SCOPES list, so one
     re-authorization covers every tool going forward.
+
+    The token file is never deleted. Reading, refreshing and writing happen
+    under _token_lock(), and the file is re-read inside the lock, so a caller
+    that waited for another caller's refresh simply picks up the new token.
+    Without a terminal (MCP stdio or streamable-http) an unusable token makes
+    the call fail with a TokenError that says why. With a terminal, a new
+    consent replaces the file only after the login succeeded.
     """
     if required_scopes is None:
         required_scopes = SCOPES
 
-    creds = None
+    with _token_lock():
+        creds, reason = _load_token_locked(required_scopes)
+    if creds is not None:
+        return creds
 
-    # Check if token file exists
-    if os.path.exists(TOKEN_FILE):
-        try:
-            # No `scopes` argument: from_authorized_user_info only reads the
-            # scopes recorded in the file when the caller passes None. Passing
-            # SCOPES here would silently overwrite whatever Google actually
-            # granted with the scopes this version of the code wants, which
-            # makes the has_scopes() check below trivially true for every
-            # token file regardless of what was really authorized.
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE)
-        except Exception as e:
-            # If token file is corrupted, delete it
-            if os.path.exists(TOKEN_FILE):
-                os.remove(TOKEN_FILE)
-            creds = None
+    # IMPORTANT: When running as MCP server (stdio), run_local_server() blocks
+    # forever because no browser can open. Only allow interactive OAuth when
+    # running directly from terminal (stdin is a TTY).
+    if not sys.stdin.isatty():
+        raise TokenError(
+            f"OAuth token cannot be used: {reason}.\n"
+            "Run the OAuth flow manually first:\n"
+            f"  cd {SCRIPT_DIR} && python gsc_server.py\n"
+            "Then restart Claude Code."
+        )
 
-    # A token missing a scope this specific call needs cannot serve it.
-    if creds is not None and not creds.has_scopes(required_scopes):
-        creds = None
+    # Check if client secrets file exists
+    if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
+        raise FileNotFoundError(
+            f"OAuth client secrets file not found. Please place a client_secrets.json file in the script directory "
+            f"or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
+        )
 
-    # If credentials don't exist or are invalid, get new ones
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                # Save the refreshed credentials
-                with open(TOKEN_FILE, 'w') as token:
-                    token.write(creds.to_json())
-            except Exception as e:
-                # If refresh fails, delete the bad token and trigger new OAuth flow
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                # Fall through to the OAuth flow below
-                creds = None
-        
-        # Start new OAuth flow if we don't have valid credentials
-        if not creds or not creds.valid:
-            # IMPORTANT: When running as MCP server (stdio), run_local_server() blocks
-            # forever because no browser can open. Only allow interactive OAuth when
-            # running directly from terminal (stdin is a TTY).
-            if not sys.stdin.isatty():
-                raise RuntimeError(
-                    "OAuth token is missing or expired and cannot be refreshed. "
-                    "Run the OAuth flow manually first:\n"
-                    f"  cd {SCRIPT_DIR} && python gsc_server.py\n"
-                    "Then restart Claude Code."
-                )
+    # Start OAuth flow (only when running interactively — isatty guard above prevents
+    # reaching this point in MCP stdio context). The lock is not held while a
+    # human logs in; the result is written under the lock afterwards.
+    flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
+    creds = flow.run_local_server(port=0)
 
-            # Check if client secrets file exists
-            if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
-                raise FileNotFoundError(
-                    f"OAuth client secrets file not found. Please place a client_secrets.json file in the script directory "
-                    f"or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
-                )
-
-            # Start OAuth flow (only when running interactively — isatty guard above prevents
-            # reaching this point in MCP stdio context).
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-            
-            # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
+    with _token_lock():
+        _write_token_atomic(creds)
 
     return creds
 
@@ -263,7 +386,8 @@ def _site_not_found_error(site_url: str) -> str:
 
 
 @mcp.tool()
-async def list_properties() -> str:
+@_run_in_worker
+def list_properties() -> str:
     """
     Retrieves and returns the user's Search Console properties.
     """
@@ -300,13 +424,15 @@ async def list_properties() -> str:
             "1. Create a service account in Google Cloud Console\n"
             "2. Download the JSON credentials file\n"
             "3. Save it as 'service_account_credentials.json' in the same directory as this script\n"
-            "4. Share your GSC properties with the service account email"
+            "4. Share your GSC properties with the service account email\n\n"
+            f"Details: {e}"
         )
     except Exception as e:
         return f"Error retrieving properties: {str(e)}"
 
 @mcp.tool()
-async def add_site(site_url: str) -> str:
+@_run_in_worker
+def add_site(site_url: str) -> str:
     """
     Add a site to your Search Console properties.
     
@@ -367,7 +493,8 @@ async def add_site(site_url: str) -> str:
         return f"Error adding site: {str(e)}"
 
 @mcp.tool()
-async def delete_site(site_url: str) -> str:
+@_run_in_worker
+def delete_site(site_url: str) -> str:
     """
     Remove a site from your Search Console properties.
     
@@ -435,7 +562,8 @@ def _verification_target(site_url: str):
 
 
 @mcp.tool()
-async def get_verification_token(site_url: str, method: str = "DNS_TXT") -> str:
+@_run_in_worker
+def get_verification_token(site_url: str, method: str = "DNS_TXT") -> str:
     """
     Get the token needed to prove ownership of a property.
 
@@ -479,7 +607,8 @@ async def get_verification_token(site_url: str, method: str = "DNS_TXT") -> str:
 
 
 @mcp.tool()
-async def verify_site(site_url: str, method: str = "DNS_TXT") -> str:
+@_run_in_worker
+def verify_site(site_url: str, method: str = "DNS_TXT") -> str:
     """
     Claim ownership of a property after its verification token is published.
 
@@ -559,7 +688,8 @@ def _verification_http_error(
 
 
 @mcp.tool()
-async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
+@_run_in_worker
+def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
     """
     Get search analytics data for a specific property.
     
@@ -627,7 +757,8 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         return f"Error retrieving search analytics: {str(e)}"
 
 @mcp.tool()
-async def get_site_details(site_url: str) -> str:
+@_run_in_worker
+def get_site_details(site_url: str) -> str:
     """
     Get detailed information about a specific Search Console property.
     
@@ -667,7 +798,8 @@ async def get_site_details(site_url: str) -> str:
         return f"Error retrieving site details: {str(e)}"
 
 @mcp.tool()
-async def get_sitemaps(site_url: str) -> str:
+@_run_in_worker
+def get_sitemaps(site_url: str) -> str:
     """
     List all sitemaps for a specific Search Console property.
     
@@ -731,7 +863,8 @@ async def get_sitemaps(site_url: str) -> str:
         return f"Error retrieving sitemaps: {str(e)}"
 
 @mcp.tool()
-async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
+@_run_in_worker
+def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """
     Enhanced URL inspection to check indexing status and rich results in Google.
     
@@ -804,7 +937,8 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         return f"Error inspecting URL: {str(e)}"
 
 @mcp.tool()
-async def batch_url_inspection(site_url: str, urls: str) -> str:
+@_run_in_worker
+def batch_url_inspection(site_url: str, urls: str) -> str:
     """
     Inspect multiple URLs in batch (within API limits).
     
@@ -888,7 +1022,8 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
         return f"Error performing batch inspection: {str(e)}"
 
 @mcp.tool()
-async def check_indexing_issues(site_url: str, urls: str) -> str:
+@_run_in_worker
+def check_indexing_issues(site_url: str, urls: str) -> str:
     """
     Check for specific indexing issues across multiple URLs.
     
@@ -992,7 +1127,8 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
         return f"Error checking indexing issues: {str(e)}"
 
 @mcp.tool()
-async def get_performance_overview(site_url: str, days: int = 28) -> str:
+@_run_in_worker
+def get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     Get a performance overview for a specific property.
     
@@ -1070,7 +1206,8 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         return f"Error retrieving performance overview: {str(e)}"
 
 @mcp.tool()
-async def get_advanced_search_analytics(
+@_run_in_worker
+def get_advanced_search_analytics(
     site_url: str, 
     start_date: str = None, 
     end_date: str = None, 
@@ -1235,7 +1372,8 @@ async def get_advanced_search_analytics(
         return f"Error retrieving advanced search analytics: {str(e)}"
 
 @mcp.tool()
-async def compare_search_periods(
+@_run_in_worker
+def compare_search_periods(
     site_url: str,
     period1_start: str,
     period1_end: str,
@@ -1371,7 +1509,8 @@ async def compare_search_periods(
         return f"Error comparing search periods: {str(e)}"
 
 @mcp.tool()
-async def get_search_by_page_query(
+@_run_in_worker
+def get_search_by_page_query(
     site_url: str,
     page_url: str,
     days: int = 28,
@@ -1453,7 +1592,8 @@ async def get_search_by_page_query(
         return f"Error retrieving page query data: {str(e)}"
 
 @mcp.tool()
-async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
+@_run_in_worker
+def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
     """
     List all sitemaps for a specific Search Console property with detailed information.
     
@@ -1521,7 +1661,8 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
         return f"Error retrieving sitemaps: {str(e)}"
 
 @mcp.tool()
-async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
+@_run_in_worker
+def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     Get detailed information about a specific sitemap.
     
@@ -1574,7 +1715,8 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         return f"Error retrieving sitemap details: {str(e)}"
 
 @mcp.tool()
-async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
+@_run_in_worker
+def submit_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     Submit a new sitemap or resubmit an existing one to Google.
     
@@ -1621,7 +1763,8 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
         return f"Error submitting sitemap: {str(e)}"
 
 @mcp.tool()
-async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
+@_run_in_worker
+def delete_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     Delete (unsubmit) a sitemap from Google Search Console.
     
@@ -1657,7 +1800,8 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
         return f"Error deleting sitemap: {str(e)}"
 
 @mcp.tool()
-async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
+@_run_in_worker
+def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
     """
     All-in-one tool to manage sitemaps (list, get details, submit, delete).
     
@@ -1681,20 +1825,22 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
             return f"The {action} action requires a sitemap_url parameter."
         
         # Perform the requested action
+        # Already inside a worker thread: call the synchronous tool bodies.
         if action == "list":
-            return await list_sitemaps_enhanced(site_url, sitemap_index)
+            return list_sitemaps_enhanced.__wrapped__(site_url, sitemap_index)
         elif action == "details":
-            return await get_sitemap_details(site_url, sitemap_url)
+            return get_sitemap_details.__wrapped__(site_url, sitemap_url)
         elif action == "submit":
-            return await submit_sitemap(site_url, sitemap_url)
+            return submit_sitemap.__wrapped__(site_url, sitemap_url)
         elif action == "delete":
-            return await delete_sitemap(site_url, sitemap_url)
+            return delete_sitemap.__wrapped__(site_url, sitemap_url)
     
     except Exception as e:
         return f"Error managing sitemaps: {str(e)}"
 
 @mcp.tool()
-async def get_creator_info() -> str:
+@_run_in_worker
+def get_creator_info() -> str:
     """
     Provides information about Amin Foroutan, the creator of the MCP-GSC tool.
     """
@@ -1727,19 +1873,16 @@ Amin combines technical SEO knowledge with programming skills to create innovati
     return creator_info
 
 @mcp.tool()
-async def reauthenticate() -> str:
+@_run_in_worker
+def reauthenticate() -> str:
     """
     Perform a logout and new login sequence.
-    Deletes the current OAuth token file and triggers the browser authentication flow.
-    Useful when you need to switch to a different Google account.
+    Runs the browser authentication flow and replaces the OAuth token file
+    once the new login succeeded. Useful when you need to switch to a
+    different Google account. stdio only: not exposed over streamable-http.
     """
     try:
-        # Delete existing token to force re-authentication
-        if os.path.exists(TOKEN_FILE):
-            os.remove(TOKEN_FILE)
-            token_deleted = True
-        else:
-            token_deleted = False
+        token_existed = os.path.exists(TOKEN_FILE)
 
         # Check if OAuth client secrets file exists
         if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
@@ -1747,53 +1890,83 @@ async def reauthenticate() -> str:
                 "Error: OAuth client secrets file not found. "
                 "Cannot start new authentication flow. "
                 "Please ensure client_secrets.json is present or set the "
-                "GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
+                "GSC_OAUTH_CLIENT_SECRETS_FILE environment variable. "
+                "The current token was left unchanged."
             )
 
         # IMPORTANT: run_local_server() blocks forever when running as MCP subprocess.
         if not sys.stdin.isatty():
-            msg = "Token deleted. " if token_deleted else ""
             return (
-                msg + "Cannot open browser for re-authentication from MCP. "
-                "Run manually:\n"
+                "Cannot open browser for re-authentication from MCP. "
+                "The current token was left unchanged. Run manually:\n"
                 f"  cd {SCRIPT_DIR} && .venv/bin/python gsc_server.py\n"
                 "Then restart Claude Code."
             )
 
-        # Trigger new OAuth flow — this opens a browser window on the local machine
+        # Trigger new OAuth flow — this opens a browser window on the local machine.
+        # The old token stays in place until this login has succeeded.
         flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
         creds = flow.run_local_server(port=0)
 
-        # Save the new credentials for future use
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
+        with _token_lock():
+            _write_token_atomic(creds)
 
         msg = "Successfully authenticated with a new Google account."
-        if token_deleted:
-            msg = "Previous session deleted. " + msg
+        if token_existed:
+            msg = "Previous token replaced. " + msg
         return msg
 
     except Exception as e:
-        return f"Error during reauthentication: {str(e)}"
+        return f"Error during reauthentication (current token left unchanged): {str(e)}"
+
+
+def _restrict_to_read_only(server):
+    """Unregisters every tool that is not on the READ_ONLY_TOOLS list."""
+    for tool in server._tool_manager.list_tools():
+        if tool.name not in READ_ONLY_TOOLS:
+            server.remove_tool(tool.name)
+
+
+def configure_streamable_http(server, host: str, port: int):
+    """
+    Prepares the server for the shared streamable-http service.
+
+    Stateless (no mcp-session-id, so a restart needs no reconnect), Host and
+    Origin checked against exactly 127.0.0.1:<port> and localhost:<port> with
+    no Origin allowed (a request without Origin passes, any Origin is
+    refused), and only the read-only tools registered. FASTMCP_* environment
+    variables are not used: settings are set here explicitly.
+    """
+    server.settings.host = host
+    server.settings.port = port
+    server.settings.stateless_http = True
+    server.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"127.0.0.1:{port}", f"localhost:{port}"],
+        allowed_origins=[],
+    )
+    _restrict_to_read_only(server)
 
 
 def main():
-    """Entry point for the MCP server. Supports stdio (default) and SSE transports."""
-    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
-    host = os.environ.get("MCP_HOST", "127.0.0.1")
-    try:
-        port = int(os.environ.get("MCP_PORT", "3001"))
-    except ValueError:
-        raise ValueError("MCP_PORT must be an integer")
+    """Entry point for the MCP server. Supports stdio (default) and streamable-http."""
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower().strip()
 
     if transport == "stdio":
         mcp.run(transport="stdio")
-    elif transport in {"sse", "http"}:
-        mcp.run(transport="sse", host=host, port=port)
+    elif transport == "streamable-http":
+        host = os.environ.get("MCP_HOST", "127.0.0.1")
+        try:
+            port = int(os.environ.get("MCP_PORT", "3001"))
+        except ValueError:
+            raise ValueError("MCP_PORT must be an integer")
+        configure_streamable_http(mcp, host, port)
+        mcp.run("streamable-http")
     else:
         raise ValueError(
             f"Unknown MCP_TRANSPORT '{transport}'. "
-            "Use 'stdio' (default) or 'sse'."
+            "Use 'stdio' (default) or 'streamable-http'. "
+            "'sse' is no longer supported."
         )
 
 
