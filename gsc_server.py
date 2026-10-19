@@ -390,9 +390,10 @@ def get_oauth_credentials(required_scopes=None):
             f"OAuth token cannot be used: {reason}.\n"
             f"Token file: {TOKEN_FILE}\n"
             "This shared HTTP service never starts a login itself. Renew the token "
-            "through the stdio admin entry google-search-console-beheer (tool "
-            "reauthenticate), which writes a new token to the file above; the "
-            "service picks it up on the next call."
+            "in an interactive terminal (a TTY, so not through an MCP client): run "
+            "gsc_server.py from a checkout that has client_secrets.json, with "
+            "GSC_CONFIG_DIR set to the directory of the file above. It writes the "
+            "new token there; the service picks it up on the next call."
         )
     if not sys.stdin.isatty():
         raise TokenError(

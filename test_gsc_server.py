@@ -1600,9 +1600,8 @@ class TestHttpModeNeverInteractiveOAuth(unittest.TestCase):
             self.assertFalse(os.path.exists(token_path))
             msg = str(ctx.exception)
             self.assertIn(token_path, msg)
-            self.assertIn("google-search-console-beheer", msg)
-            self.assertIn("reauthenticate", msg)
-            self.assertNotIn("python gsc_server.py", msg)
+            self.assertIn("interactive terminal", msg)
+            self.assertIn("GSC_CONFIG_DIR", msg)
 
     def test_unusable_token_with_tty_is_left_untouched(self):
         with tempfile.TemporaryDirectory() as tmpdir:
